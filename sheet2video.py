@@ -974,6 +974,7 @@ class SheetScene(Scene):
             Line([0, 0, 0], [0, 1, 0], stroke_width=2.4),
             Line([0, 0, 0], [0, 1, 0], stroke_width=14),
         )
+        cursor.set_z_index(10)  # systems are added later, so order alone would draw them over it
         cursor_state = {"in": False}
         in_scene: set[int] = set()
         fade_in_at = []
