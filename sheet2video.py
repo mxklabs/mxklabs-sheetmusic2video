@@ -13,6 +13,7 @@ quiet grey-blue.
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import tempfile
@@ -414,6 +415,21 @@ class Ink:
     t_off: float
 
 
+def soft_light(color: str, radius: float, peak: float, rings: int = 9) -> VGroup:
+    """Radial glow built from stacked translucent discs (peak = opacity at the centre)."""
+    g = VGroup(*[Circle(radius=radius * (i + 1) / rings) for i in range(rings)])
+    for c in g:
+        c.set_fill(color, opacity=peak / rings).set_stroke(width=0)
+    g.base = peak / rings  # type: ignore[attr-defined]
+    g.color_hex = color  # type: ignore[attr-defined]
+    return g
+
+
+def set_light(g: VGroup, k: float) -> None:
+    for c in g:
+        c.set_fill(g.color_hex, opacity=g.base * k)  # type: ignore[attr-defined]
+
+
 # ----------------------------------------------------------------- scene ---
 class SheetScene(Scene):
     def __init__(self, meta: Meta, eng: Engraving, tempo: TempoMap, cfg: Config, still: float | None = None, **kw):
@@ -447,6 +463,29 @@ class SheetScene(Scene):
         )
         cursor.set_z_index(10)  # systems are added later, so order alone would draw them over it
         cursor_state = {"in": False}
+
+        # Atmosphere: two slow ambient lights, a light that follows the cursor, and drifting dust.
+        ambient = [
+            (soft_light("#3C4F73", 8.0, 0.55, 22), (4.2, 2.0), (31.0, 43.0), 0.0),
+            (soft_light("#6B5233", 6.5, 0.38, 22), (4.8, 1.6), (37.0, 29.0), 2.1),
+        ]
+        for light, *_ in ambient:
+            light.set_z_index(-10)
+        cursor_light = soft_light(CURSOR, 3.0, 0.16, 14)
+        cursor_light.set_z_index(-5)
+        rng = np.random.default_rng(7)
+        dust = []
+        for _ in range(26):
+            r = float(rng.uniform(0.01, 0.028))
+            d = Circle(radius=r).set_stroke(width=0).set_fill("#CFC6B4", opacity=0)
+            d.set_z_index(-8)
+            dust.append((d, rng.uniform(-7.1, 7.1), rng.uniform(0, 8), rng.uniform(0.04, 0.11),
+                         rng.uniform(0.2, 0.7), rng.uniform(0.15, 0.45), rng.uniform(0, 6.28), rng.uniform(5, 11)))
+        for light, *_ in ambient:
+            self.add(light)
+        for d, *_ in dust:
+            self.add(d)
+        offsets = {}
         in_scene: set[int] = set()
         fade_in_at = []
         for i in range(len(plans)):
@@ -471,6 +510,16 @@ class SheetScene(Scene):
             g = 1 - smooth((t - fade_start) / 2.2)
             ta = smooth((t - 0.6) / 1.4) * (1 - smooth((t - (lead - 3.4)) / 1.4))
             title_group.set_opacity(ta)
+            fade_in = smooth(t / 4.0)
+            for light, (ax, ay), (px, py), ph in ambient:
+                light.move_to([ax * math.sin(2 * math.pi * t / px + ph), ay * math.cos(2 * math.pi * t / py + ph), 0])
+                set_light(light, fade_in * g)
+            for d, x0, y0, speed, sway, peak, ph, per in dust:
+                y = (y0 + speed * t) % 8.4 - 4.2
+                d.move_to([x0 + sway * math.sin(2 * math.pi * t / per + ph), y, 0])
+                edge = smooth(min(y + 4.2, 4.2 - y) / 1.2)
+                twinkle = 0.65 + 0.35 * math.sin(2 * math.pi * t / (per * 0.6) + ph)
+                d.set_fill("#CFC6B4", opacity=peak * edge * twinkle * fade_in * g)
             cur = None
             for i, sysm in enumerate(self.systems):
                 v = vis_of(i, t) * g
@@ -481,6 +530,11 @@ class SheetScene(Scene):
                     self.remove(sysm.group)
                     in_scene.discard(i)
                 if i in in_scene:
+                    # Slow, out-of-phase drift so the staves seem to float.
+                    target = np.array([0.035 * math.sin(2 * math.pi * t / 13 + i * 1.7),
+                                       0.055 * math.sin(2 * math.pi * t / 9 + i * 2.3), 0.0])
+                    sysm.group.shift(target - offsets.get(i, np.zeros(3)))
+                    offsets[i] = target
                     sysm.refresh(t, v)
                 if T[i] <= t < T[i + 1]:
                     cur = i
@@ -488,18 +542,22 @@ class SheetScene(Scene):
                 cur = 0 if t < T[0] else len(self.systems) - 1
             sysm = self.systems[cur]
             beat = min(max(tempo.beat(t - lead), plans[cur].b0), plans[cur].b1)
-            x = sysm.X(beat)
+            off = offsets.get(cur, np.zeros(3))
+            x = sysm.X(beat) + off[0]
             y_top, y_bot = sysm.y_extent()
+            y_top, y_bot = y_top + off[1], y_bot + off[1]
             for ln in cursor:
                 ln.put_start_and_end_on([x, y_bot, 0], [x, y_top, 0])
             a = smooth((t - (lead - 1.4)) / 1.0) * g
+            cursor_light.move_to([x, (y_top + y_bot) / 2, 0])
+            set_light(cursor_light, a)
             cursor[0].set_stroke(CURSOR, opacity=0.7 * a)
             cursor[1].set_stroke(CURSOR, opacity=0.07 * a)
             if a > 0.002 and not cursor_state["in"]:
-                self.add(cursor)
+                self.add(cursor, cursor_light)
                 cursor_state["in"] = True
             elif a <= 0.002 and cursor_state["in"]:
-                self.remove(cursor)
+                self.remove(cursor, cursor_light)
                 cursor_state["in"] = False
 
         title_group.set_opacity(0)
