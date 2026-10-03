@@ -1,42 +1,37 @@
 """Render a piano MusicXML score as a calm, 4K Manim video.
 
-The score is engraved as a grand staff in two alternating slots (top / bottom).
-A soft cursor sweeps the active system; notes warm up as they sound and then
-settle into a quiet grey-blue.
+Engraving is done by Verovio (SMuFL fonts, proper spacing, beams, slurs, dynamics).
+The score is shown as a grand staff in two alternating slots (top / bottom). A soft
+cursor sweeps the active system; notes warm up as they sound and then settle into a
+quiet grey-blue.
 
     python sheet2video.py score.musicxml -o score.mp4            # 4K
     python sheet2video.py score.musicxml --preview               # 720p, fast
     python sheet2video.py score.musicxml --still 20 -o frame.png # one frame
-
-Supported: single/multi-voice piano, chords, ties, slurs, beams, flags, dots,
-accidentals, key/time signature (start of piece), dynamics, tempo markings,
-compressed .mxl. Not rendered: grace notes, tuplet brackets, repeats, pedal.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
+import re
 import sys
+import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import verovio
 from manim import (
-    BraceBetweenPoints,
     Circle,
-    Ellipse,
     Line,
-    LEFT,
     ManimColor,
     Mobject,
-    Polygon,
     Scene,
+    SVGMobject,
     Text,
     VGroup,
-    VMobject,
     tempconfig,
 )
 
@@ -53,88 +48,23 @@ CURSOR = "#C9AE7B"
 TITLE = "#D8D2C5"
 SUBTITLE = "#7F8591"
 
-FONT_SYMBOLS = "Apple Symbols"
-FONT_TEXT = "Palatino"
-
-STEP_INDEX = {"C": 0, "D": 1, "E": 2, "F": 3, "G": 4, "A": 5, "B": 6}
-ACC_GLYPHS = {
-    "sharp": "♯",
-    "flat": "♭",
-    "natural": "♮",
-    "double-sharp": "×",
-    "flat-flat": "♭♭",
-    "natural-sharp": "♯",
-    "natural-flat": "♭",
-}
-FLAGS = {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4}
-SHARP_POS = [8, 5, 9, 6, 3, 7, 4]  # treble-clef positions, 0 = bottom line
-FLAT_POS = [4, 7, 3, 6, 2, 5, 1]
-
-
-# ------------------------------------------------------------- data model ---
-@dataclass
-class Note:
-    staff: int
-    voice: str
-    start: float
-    dur: float
-    idx: int  # diatonic index, octave * 7 + step
-    pos: int  # staff position, 0 = bottom line
-    alter: int
-    acc: str | None
-    type: str
-    dots: int
-    stem: str | None
-    beams: dict[int, str]
-    tie_start: bool
-    tie_stop: bool
-    measure: int
-    slur_placement: str | None = None
+VEROVIO_STAFF_SPACE_PX = 18.0  # one staff space in Verovio's SVG pixels (sets how many measures fit per system)
 
 
 @dataclass
-class Rest:
-    staff: int
-    voice: str
-    start: float
-    dur: float
-    type: str
-    dots: int
-    whole_measure: bool
-    pos: int | None
-    measure: int
+class Config:
+    space: float = 0.18  # staff space in scene units
+    slot_width: float = 12.6
+    slot_y: float = 2.0
+    lead: float = 7.0  # seconds before the first beat
+    tail: float = 3.0
 
 
 @dataclass
-class Measure:
-    index: int
-    start: float
-    length: float
-    fifths: int
-    time: tuple[int, int]
-    clefs: dict[int, str]  # staff -> "G" | "F" | "C"
-    last_onset: float = 0.0
-
-
-@dataclass
-class Link:
-    a: Note
-    b: Note
-    kind: str  # "tie" | "slur"
-    placement: str | None
-
-
-@dataclass
-class Score:
+class Meta:
     title: str
     composer: str
-    measures: list[Measure]
-    notes: list[Note]
-    rests: list[Rest]
-    links: list[Link]
-    dynamics: list[tuple[float, str]]
-    tempos: list[tuple[float, float]]
-    staves: int
+    has_tempo: bool
 
 
 def _open_xml(path: Path) -> ET.Element:
@@ -146,158 +76,15 @@ def _open_xml(path: Path) -> ET.Element:
     return ET.parse(path).getroot()
 
 
-def _bottom_idx(sign: str, line: int) -> int:
-    ref = {"G": 4 * 7 + 4, "F": 3 * 7 + 3, "C": 4 * 7}[sign]
-    return ref - 2 * (line - 1)
-
-
-def parse_musicxml(path: Path) -> Score:
+def read_meta(path: Path) -> Meta:
     root = _open_xml(path)
-    if root.tag != "score-partwise":
-        raise ValueError("Only score-partwise MusicXML is supported")
-
     title = (root.findtext("work/work-title") or root.findtext("movement-title") or path.stem).strip()
     composer = ""
     for c in root.findall("identification/creator"):
         if c.get("type") == "composer" and c.text:
             composer = c.text.strip()
-
-    notes: list[Note] = []
-    rests: list[Rest] = []
-    links: list[Link] = []
-    dynamics: list[tuple[float, str]] = []
-    tempos: list[tuple[float, float]] = []
-    measures: list[Measure] = []
-    max_staff = 1
-
-    for part_no, part in enumerate(root.findall("part")):
-        divisions = 1.0
-        bottoms: dict[int, int] = {}
-        signs: dict[int, str] = {}
-        fifths = 0
-        time = (4, 4)
-        open_slurs: dict[str, Note] = {}
-        pending_notes: list[Note] = []
-        cursor_beat = 0.0
-
-        for m_i, m in enumerate(part.findall("measure")):
-            if part_no == 0:
-                mstart = cursor_beat
-            else:
-                mstart = measures[m_i].start
-            cursor = 0.0  # in divisions
-            last_start = 0.0
-            max_cursor = 0.0
-            last_onset = 0.0
-
-            for el in m:
-                tag = el.tag
-                if tag == "attributes":
-                    d = el.findtext("divisions")
-                    if d:
-                        divisions = float(d)
-                    f = el.findtext("key/fifths")
-                    if f is not None:
-                        fifths = int(f)
-                    if el.find("time") is not None:
-                        time = (int(el.findtext("time/beats")), int(el.findtext("time/beat-type")))
-                    for clef in el.findall("clef"):
-                        s = int(clef.get("number", "1")) + (part_no if part_no and len(root.findall("part")) > 1 else 0)
-                        sign = clef.findtext("sign", "G")
-                        sign = sign if sign in ("G", "F", "C") else "G"
-                        line = int(clef.findtext("line", {"G": "2", "F": "4", "C": "3"}[sign]))
-                        bottoms[s] = _bottom_idx(sign, line)
-                        signs[s] = sign
-                elif tag == "backup":
-                    cursor -= float(el.findtext("duration"))
-                elif tag == "forward":
-                    cursor += float(el.findtext("duration"))
-                    max_cursor = max(max_cursor, cursor)
-                elif tag == "sound" and el.get("tempo"):
-                    tempos.append((mstart + cursor / divisions, float(el.get("tempo"))))
-                elif tag == "direction":
-                    snd = el.find("sound")
-                    if snd is not None and snd.get("tempo"):
-                        tempos.append((mstart + cursor / divisions, float(snd.get("tempo"))))
-                    dyn = el.find("direction-type/dynamics")
-                    if dyn is not None and len(dyn):
-                        dynamics.append((mstart + cursor / divisions, dyn[0].tag))
-                elif tag == "note":
-                    if el.find("grace") is not None:
-                        continue
-                    dur = float(el.findtext("duration", "0"))
-                    is_chord = el.find("chord") is not None
-                    start = last_start if is_chord else cursor
-                    staff = int(el.findtext("staff", "1"))
-                    if part_no and len(root.findall("part")) > 1:
-                        staff += part_no
-                    max_staff = max(max_staff, staff)
-                    voice = el.findtext("voice", "1")
-                    ntype = el.findtext("type", "")
-                    dots = len(el.findall("dot"))
-                    start_b = mstart + start / divisions
-                    dur_b = dur / divisions
-                    last_onset = max(last_onset, start / divisions)
-
-                    if el.find("rest") is not None:
-                        if el.get("print-object") != "no":
-                            r = el.find("rest")
-                            pos = None
-                            if r.findtext("display-step"):
-                                idx = int(r.findtext("display-octave")) * 7 + STEP_INDEX[r.findtext("display-step")]
-                                pos = idx - bottoms.get(staff, _bottom_idx("G", 2))
-                            rests.append(Rest(staff, voice, start_b, dur_b, ntype, dots,
-                                              r.get("measure") == "yes", pos, m_i))
-                    else:
-                        p = el.find("pitch")
-                        if p is not None:
-                            idx = int(p.findtext("octave")) * 7 + STEP_INDEX[p.findtext("step")]
-                            ties = {t.get("type") for t in el.findall("tie")}
-                            slur_place = None
-                            n = Note(
-                                staff, voice, start_b, dur_b, idx,
-                                idx - bottoms.get(staff, _bottom_idx("G", 2) if staff == 1 else _bottom_idx("F", 4)),
-                                int(float(p.findtext("alter", "0"))),
-                                el.findtext("accidental"), ntype, dots, el.findtext("stem"),
-                                {int(b.get("number", "1")): (b.text or "") for b in el.findall("beam")},
-                                "start" in ties, "stop" in ties, m_i,
-                            )
-                            notes.append(n)
-                            for s in el.findall("notations/slur"):
-                                key = f"{part_no}:{s.get('number', '1')}"
-                                if s.get("type") == "start":
-                                    open_slurs[key] = n
-                                    n.slur_placement = s.get("placement")
-                                elif s.get("type") == "stop" and key in open_slurs:
-                                    a = open_slurs.pop(key)
-                                    links.append(Link(a, n, "slur", a.slur_placement))
-                            pending_notes.append(n)
-                    if not is_chord:
-                        last_start = cursor
-                        cursor += dur
-                    max_cursor = max(max_cursor, cursor)
-
-            length = max_cursor / divisions if max_cursor else time[0] * 4 / time[1]
-            if part_no == 0:
-                measures.append(Measure(m_i, mstart, length, fifths, time, dict(signs), last_onset))
-                cursor_beat += length
-            else:
-                measures[m_i].last_onset = max(measures[m_i].last_onset, last_onset)
-
-    # Ties: link each tie-start with the note it continues into.
-    for a in notes:
-        if not a.tie_start:
-            continue
-        for b in notes:
-            if (b.tie_stop and b.staff == a.staff and b.idx == a.idx and b.alter == a.alter
-                    and abs(b.start - (a.start + a.dur)) < 1e-6):
-                links.append(Link(a, b, "tie", None))
-                break
-
-    if not measures:
-        raise ValueError("No measures found")
-    tempos.sort()
-    return Score(title, composer, measures, notes, rests, links, dynamics, tempos, 2 if max_staff > 1 else 1)
+    has_tempo = any(s.get("tempo") for s in root.iter("sound"))
+    return Meta(title, composer, has_tempo)
 
 
 # ------------------------------------------------------------------ tempo ---
@@ -324,18 +111,6 @@ class TempoMap:
         sec = max(sec, 0.0)
         i = max(j for j, s in enumerate(self.secs) if s <= sec)
         return self.beats[i] + (sec - self.secs[i]) / self.spb[i]
-
-
-# ----------------------------------------------------------------- config ---
-@dataclass
-class Config:
-    space: float = 0.18  # staff space in scene units
-    slot_width: float = 12.6
-    slot_y: float = 2.0
-    u_min: float = 1.15  # scene units per quarter note
-    u_max: float = 1.9
-    lead: float = 7.0  # seconds before the first beat
-    tail: float = 3.0
 
 
 # ------------------------------------------------------------- colour mix ---
@@ -375,504 +150,230 @@ def glow_env(t: float, t_on: float, t_off: float) -> float:
     return smooth((t_off - t_on) / 0.2) * (1 - smooth((t - t_off) / 1.6))
 
 
-# ----------------------------------------------------------- engraving ---
-@dataclass
-class Ink:
-    mob: Mobject
-    t_on: float
-    t_off: float
-
-
-@dataclass
-class Event:
-    staff: int
-    voice: str
-    start: float
-    dur: float
-    notes: list[Note]
-    type: str
-    dots: int
-    stem: str | None
-    beams: dict[int, str]
-    dir: int = 1
-    x: float = 0.0
-    t_on: float = 0.0
-    t_off: float = 0.0
-    info: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)  # stem x, start y, extreme head y, tip y
-
-
+# --------------------------------------------------------------- engraving ---
 @dataclass
 class SystemPlan:
-    measures: list[Measure]
+    svg: str
     b0: float
     b1: float
-    header_w: float
-    u: float
-    first: bool
-    fifths: int
-    time: tuple[int, int]
-    clefs: dict[int, str]
+    note_ids: list[str]
+
+
+@dataclass
+class Engraving:
+    plans: list[SystemPlan]
+    on: dict[str, float]  # note id -> onset (quarter notes)
+    off: dict[str, float]
+    onsets: list[float]  # every onset in the piece, sorted
+    tempos: list[tuple[float, float]]
+    end: float
+
+
+def engrave(src: Path, cfg: Config) -> Engraving:
+    tk = verovio.toolkit()
+    tk.setOptions({
+        "pageWidth": round(cfg.slot_width * VEROVIO_STAFF_SPACE_PX / cfg.space),
+        "scale": 100,
+        "systemMaxPerPage": 1,
+        "adjustPageHeight": True,
+        "breaks": "auto",
+        "header": "none",
+        "footer": "none",
+        "pageMarginLeft": 30,
+        "pageMarginRight": 30,
+        "pageMarginTop": 0,
+        "pageMarginBottom": 0,
+    })
+    if not tk.loadFile(str(src)):
+        raise ValueError(f"Verovio could not read {src}")
+
+    tm = tk.renderToTimemap({"includeMeasures": True, "includeRests": True})
+    on: dict[str, float] = {}
+    off: dict[str, float] = {}
+    measure_q: dict[str, float] = {}
+    tempos: list[tuple[float, float]] = []
+    for e in tm:
+        q = float(e["qstamp"])
+        for i in e.get("on", []):
+            on[i] = q
+        for i in e.get("off", []):
+            off[i] = q
+        if "measureOn" in e:
+            measure_q[e["measureOn"]] = q
+        if "tempo" in e:
+            tempos.append((q, float(e["tempo"])))
+    end = max(float(e["qstamp"]) for e in tm)
+
+    svgs = [tk.renderToSVG(p) for p in range(1, tk.getPageCount() + 1)]
+    starts = []
+    for svg in svgs:
+        mids = re.findall(r'<g id="([\w-]+)" class="measure"', svg)
+        starts.append(min(measure_q[m] for m in mids if m in measure_q))
+    plans = [
+        SystemPlan(svg, starts[i], starts[i + 1] if i + 1 < len(svgs) else end,
+                   re.findall(r'<g id="([\w-]+)" class="note"', svg))
+        for i, svg in enumerate(svgs)
+    ]
+    return Engraving(plans, on, off, sorted(set(on.values())), tempos, end)
 
 
 class System:
-    """Visual objects and timing for one system occupying one slot."""
+    """One Verovio system placed in a slot, with per-note colour/glow timing."""
 
-    def __init__(self, plan: SystemPlan, score: Score, tempo: TempoMap, cfg: Config, ox: float, oy: float, lead: float):
-        self.plan, self.score, self.tempo, self.cfg = plan, score, tempo, cfg
-        self.ox, self.oy, self.lead = ox, oy, lead
+    def __init__(self, plan: SystemPlan, eng: Engraving, tempo: TempoMap, cfg: Config,
+                 ox: float, oy: float, lead: float):
+        self.plan, self.cfg, self.lead, self.tempo = plan, cfg, lead, tempo
         self.S = cfg.space
-        self.hw = 0.62 * self.S
-        self.hh = 0.46 * self.S
-        self.x0 = ox + plan.header_w
-        self.pad_l = 0.4
-        self.u = plan.u
         self.statics: list[tuple[Mobject, str]] = []
         self.inks: list[Ink] = []
-        self.glow_layer = VGroup()
-        self.static_layer = VGroup()
-        self.ink_layer = VGroup()
-        self.group = VGroup(self.glow_layer, self.static_layer, self.ink_layer)
         self.glows: list[tuple[VGroup, float, float]] = []
         self.vis = -1.0
-        self.pending: list[Ink] = []
         self.active: list[Ink] = []
         self.active_glows: list[tuple[VGroup, float, float]] = []
-        self.pending_glows: list[tuple[VGroup, float, float]] = []
-        self.staff_ids = [1, 2] if score.staves == 2 else [1]
-        self.bases = {1: oy + 2.5 * self.S, 2: oy - 6.5 * self.S} if score.staves == 2 else {1: oy - 2 * self.S}
-        self.barline_x: dict[int, float] = {}
-        self._build()
+        self.glow_layer = VGroup()
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "system.svg"
+            path.write_text(plan.svg, encoding="utf-8")
+            svg = SVGMobject(str(path), height=None, should_center=False)
+        leaves = list(svg.submobjects)
+        flat = [m for m in leaves if m.height < 1e-3 and m.width > 0]
+        widest = max(m.width for m in flat)
+        lines = [m for m in flat if m.width > 0.15 * widest]  # staff lines, not ledger lines
+        ys = sorted({round(float(m.get_center()[1]), 4) for m in lines}, reverse=True)
+        native_space = min(a - b for a, b in zip(ys, ys[1:]) if a - b > 1e-3)
+        svg.scale(self.S / native_space, about_point=np.zeros(3))
+        self.svg = svg
+        left = min(m.get_left()[0] for m in lines)
+        self.x_end = max(m.get_right()[0] for m in lines)
+        mid = (max(m.get_top()[1] for m in lines) + min(m.get_bottom()[1] for m in lines)) / 2
+        svg.shift(np.array([ox + 0.3 - left, oy - mid, 0.0]))
+        self.x_end += ox + 0.3 - left
+        self.y_top = max(m.get_top()[1] for m in lines) + 2.2 * self.S
+        self.y_bot = min(m.get_bottom()[1] for m in lines) - 2.2 * self.S
+        self.group = VGroup(self.glow_layer, svg)
+
+        self._classify(leaves, lines, eng)
         self.pending = sorted(self.inks, key=lambda i: i.t_on)
-        self.pending_glows.sort(key=lambda g: g[1])
-        self.static_layer.set_z_index(0)
-
-    # -- helpers
-    def X(self, beat: float) -> float:
-        return self.x0 + self.pad_l + (beat - self.plan.b0) * self.u
-
-    def Y(self, staff: int, pos: float) -> float:
-        return self.bases[staff] + pos * self.S / 2
+        self.pending_glows = sorted(self.glows, key=lambda g: g[1])
 
     def sec(self, beat: float) -> float:
         return self.lead + self.tempo.seconds(beat)
 
+    def _classify(self, leaves: list, lines: list, eng: Engraving) -> None:
+        d = self.svg.id_to_vgroup_dict
+        svg_text = self.plan.svg
+
+        def leaves_of(i: str) -> list:
+            return list(d[i].submobjects) if i in d else []
+
+        def ids(cls: str) -> list[str]:
+            return re.findall(rf'<g id="([\w-]+)" class="{cls}"', svg_text)
+
+        used: set[int] = set()
+        times: dict[str, tuple[float, float]] = {}
+        known = [(i, eng.on[i], eng.off.get(i, eng.on[i])) for i in self.plan.note_ids if i in eng.on]
+        for i, q0, q1 in known:
+            times[i] = (q0, q1)
+        # Tied-to notes are absent from the timemap; infer their onset from horizontal position.
+        if known:
+            xs = [(self._head(leaves_of(i)).get_center()[0], q0) for i, q0, _ in known]
+            xs.sort()
+            for i in self.plan.note_ids:
+                if i in times or not leaves_of(i):
+                    continue
+                x = self._head(leaves_of(i)).get_center()[0]
+                q0 = min(xs, key=lambda p: abs(p[0] - x))[1]
+                nxt = next((o for o in eng.onsets if o > q0 + 1e-9), q0 + 1)
+                times[i] = (q0, nxt)
+
+        knots: dict[float, list[float]] = {}
+        for i in self.plan.note_ids:
+            ls = leaves_of(i)
+            if i not in times or not ls:
+                continue
+            q0, q1 = times[i]
+            t_on = self.sec(q0)
+            t_off = max(self.sec(q1), t_on + 0.5)
+            self._add_ink(ls, t_on, t_off, used)
+            head = self._head(ls)
+            knots.setdefault(q0, []).append(float(head.get_center()[0]))
+            glow = VGroup(*[Circle(radius=r * self.S).move_to(head.get_center()) for r in (1.1, 1.8, 2.6)])
+            for c in glow:
+                c.set_fill(ACTIVE, opacity=0).set_stroke(width=0)
+            self.glows.append((glow, t_on, t_off))
+
+        # Chord stems and beams belong to several notes; colour them over the group's span.
+        for cls in ("chord", "beam"):
+            for i in ids(cls):
+                note_leaves = {id(m) for n in ids("note") if n in times and self._inside(leaves_of(n), leaves_of(i))
+                               for m in leaves_of(n)}
+                own = [m for m in leaves_of(i) if id(m) not in note_leaves and id(m) not in used]
+                members = [times[n] for n in ids("note") if n in times and self._inside(leaves_of(n), leaves_of(i))]
+                if own and members:
+                    t_on = self.sec(min(m[0] for m in members))
+                    t_off = max(self.sec(max(m[1] for m in members)), t_on + 0.5)
+                    self._add_ink(own, t_on, t_off, used)
+
+        for cls in ("rest", "mRest"):
+            for i in ids(cls):
+                for m in leaves_of(i):
+                    if id(m) not in used:
+                        used.add(id(m))
+                        self._static(m, REST)
+        for cls in ("tie", "slur"):
+            for i in ids(cls):
+                for m in leaves_of(i):
+                    if id(m) not in used:
+                        used.add(id(m))
+                        self._static(m, TIE)
+        line_ids = {id(m) for m in lines}
+        for m in leaves:
+            if id(m) not in used:
+                self._static(m, STAFF if id(m) in line_ids else MARK)
+
+        if not knots:
+            self.knots: list[tuple[float, float]] = [(self.plan.b0, self.x_end), (self.plan.b1, self.x_end)]
+            return
+        pts = sorted((q, float(np.median(v))) for q, v in knots.items())
+        if pts[0][0] > self.plan.b0 + 1e-6:
+            pts.insert(0, (self.plan.b0, pts[0][1] - 0.3))
+        if pts[-1][0] < self.plan.b1:
+            pts.append((self.plan.b1, self.x_end))
+        self.knots = pts
+
+    @staticmethod
+    def _inside(inner: list, outer: list) -> bool:
+        s = {id(m) for m in outer}
+        return bool(inner) and all(id(m) in s for m in inner)
+
+    @staticmethod
+    def _head(leaves: list):
+        return max(leaves, key=lambda m: m.width)
+
     def _static(self, mob: Mobject, color: str) -> None:
         mob.set_color(color)
         self.statics.append((mob, color))
-        self.static_layer.add(mob)
 
-    def _ink(self, mob: Mobject, t_on: float, t_off: float) -> None:
-        mob.set_color(UNPLAYED)
-        self.inks.append(Ink(mob, t_on, t_off))
-        self.ink_layer.add(mob)
-
-    _glyph_cache: dict[tuple[str, str], Text] = {}
-
-    def _glyph(self, ch: str, height: float, font: str = FONT_SYMBOLS) -> Text:
-        key = (ch, font)
-        if key not in System._glyph_cache:
-            System._glyph_cache[key] = Text(ch, font=font)
-        g = System._glyph_cache[key].copy()
-        g.scale_to_fit_height(height)
-        return g
-
-    # -- build
-    def _build(self) -> None:
-        p, S = self.plan, self.S
-        last = p.measures[-1]
-        d_last = self._barline_offset(last)
-        self.x_end = self.X(p.b1) - d_last
-        self._staves()
-        self._header()
-        events = self._events()
-        self._beam_groups(events)
-        for ev in events:
-            self._render_event(ev)
-        self._rests()
-        self._barlines()
-        self._dynamics()
-        self._links()
-
-    def _barline_offset(self, m: Measure) -> float:
-        d = max(m.start + m.length - (m.start + m.last_onset), 0.25)
-        return min(d * self.u / 2, 0.8)
-
-    def _staves(self) -> None:
-        x_a = self.ox + 0.35
-        for s in self.staff_ids:
-            for k in range(5):
-                y = self.Y(s, 2 * k)
-                self._static(Line([x_a, y, 0], [self.x_end, y, 0], stroke_width=2.0), STAFF)
-        if self.score.staves == 2:
-            top, bot = self.Y(1, 8), self.Y(2, 0)
-            self._static(Line([x_a, top, 0], [x_a, bot, 0], stroke_width=2.2), MARK)
-            self._static(Line([self.x_end, top, 0], [self.x_end, bot, 0], stroke_width=2.2), MARK)
-            brace = BraceBetweenPoints([x_a - 0.08, bot, 0], [x_a - 0.08, top, 0], direction=LEFT)
-            brace.set_fill(opacity=1).set_stroke(width=0)
-            brace.stretch_to_fit_width(0.16)
-            brace.move_to([x_a - 0.08 - 0.08, (top + bot) / 2, 0])
-            self._static(brace, MARK)
-
-    def _header(self) -> None:
-        p, S = self.plan, self.S
-        x = self.ox + 0.35 + 0.18
-        for s in self.staff_ids:
-            sign = p.clefs.get(s, "G" if s == 1 else "F")
-            if sign == "F":
-                g = self._glyph("𝄢", 3.4 * S)
-                g.move_to([x + 0.2, self.Y(s, 5.6), 0])
-            else:
-                g = self._glyph("𝄞", 7.6 * S)
-                g.move_to([x + 0.2, self.Y(s, 3.6), 0])
-            self._static(g, MARK)
-        kx = x + 0.7
-        n = abs(p.fifths)
-        for s in self.staff_ids:
-            sign = p.clefs.get(s, "G" if s == 1 else "F")
-            shift = -2 if sign == "F" else 0
-            table = SHARP_POS if p.fifths > 0 else FLAT_POS
-            for i in range(n):
-                pos = table[i] + shift
-                if pos < 0:
-                    pos += 7
-                ch = "♯" if p.fifths > 0 else "♭"
-                g = self._glyph(ch, 2.7 * S if ch == "♯" else 2.3 * S)
-                g.move_to([kx + i * 1.05 * S, self.Y(s, pos) + (0.0 if ch == "♯" else 0.3 * S), 0])
-                self._static(g, MARK)
-        if p.first:
-            tx = kx + n * 1.05 * S + 0.3
-            for s in self.staff_ids:
-                for txt, pos in ((str(p.time[0]), 6), (str(p.time[1]), 2)):
-                    g = self._glyph(txt, 2.0 * S, FONT_TEXT)
-                    g.move_to([tx, self.Y(s, pos), 0])
-                    self._static(g, MARK)
-
-    def _events(self) -> list[Event]:
-        p = self.plan
-        idxs = {m.index for m in p.measures}
-        groups: dict[tuple[int, str, float], list[Note]] = {}
-        for n in self.score.notes:
-            if n.measure in idxs:
-                groups.setdefault((n.staff, n.voice, round(n.start, 6)), []).append(n)
-        events: list[Event] = []
-        for (staff, voice, start), ns in groups.items():
-            ns.sort(key=lambda n: n.pos)
-            f = ns[0]
-            ev = Event(staff, voice, start, f.dur, ns, f.type, f.dots, f.stem, f.beams)
-            ev.x = self.X(start)
-            ev.t_on = self.sec(start)
-            ev.t_off = max(self.sec(start + f.dur), ev.t_on + 0.5)
-            if f.stem in ("up", "down"):
-                ev.dir = 1 if f.stem == "up" else -1
-            else:
-                mean = sum(n.pos for n in ns) / len(ns)
-                ev.dir = 1 if mean < 4 else -1
-            events.append(ev)
-        events.sort(key=lambda e: (e.staff, e.voice, e.start))
-        return events
-
-    def _beam_groups(self, events: list[Event]) -> None:
-        self.beam_groups: list[list[Event]] = []
-        self.beamed: set[int] = set()
-        cur: list[Event] = []
-        key = None
-        for ev in events:
-            k = (ev.staff, ev.voice)
-            state = ev.beams.get(1)
-            if k != key:
-                cur, key = [], k
-            if state == "begin":
-                cur = [ev]
-            elif state in ("continue", "end") and cur:
-                cur.append(ev)
-                if state == "end":
-                    if len(cur) > 1:
-                        self.beam_groups.append(cur)
-                        self.beamed.update(id(e) for e in cur)
-                    cur = []
-        for g in self.beam_groups:
-            d = g[0].dir
-            for e in g:
-                e.dir = d
-
-    def _heads(self, ev: Event) -> dict[int, float]:
-        S, hw = self.S, self.hw
-        offsets: dict[int, float] = {}
-        ns = ev.notes
-        order = ns if ev.dir == 1 else list(reversed(ns))
-        prev = None
-        for n in order:
-            off = 0.0
-            if prev is not None and abs(n.pos - prev.pos) == 1 and offsets[id(prev)] == 0.0:
-                off = 2 * hw * 0.95 * ev.dir
-            offsets[id(n)] = off
-            prev = n
-        return offsets
-
-    def _render_event(self, ev: Event) -> None:
-        S, hw, hh = self.S, self.hw, self.hh
-        offsets = self._heads(ev)
-        solid = ev.type not in ("whole", "half")
-        accs: list[Note] = []
-        for n in ev.notes:
-            x = ev.x + offsets[id(n)]
-            y = self.Y(ev.staff, n.pos)
-            head = Ellipse(width=2 * hw, height=2 * hh).rotate(math.radians(20))
-            head.move_to([x, y, 0])
-            if solid:
-                head.set_fill(opacity=1).set_stroke(width=0.5)
-            else:
-                head.set_fill(opacity=0).set_stroke(width=2.8)
-            self._ink(head, ev.t_on, ev.t_off)
-            glow = VGroup(*[Circle(radius=r * S).move_to([x, y, 0]) for r in (1.1, 1.8, 2.6)])
-            for c in glow:
-                c.set_fill(ACTIVE, opacity=0).set_stroke(width=0)
-            self.glows.append((glow, ev.t_on, ev.t_off))
-            self.pending_glows.append((glow, ev.t_on, ev.t_off))
-            self._ledgers(ev, n, x)
-            if n.type != "whole":
-                for k in range(n.dots):
-                    dy = 0.5 * S if n.pos % 2 == 0 else 0.0
-                    dot = Circle(radius=0.2 * S).set_fill(opacity=1).set_stroke(width=0)
-                    dot.move_to([x + hw + (0.55 + 0.5 * k) * S, y + dy, 0])
-                    self._ink(dot, ev.t_on, ev.t_off)
-            if n.acc in ACC_GLYPHS:
-                accs.append(n)
-        self._accidentals(ev, accs, offsets)
-        if ev.type == "whole" or ev.type == "":
+    def _add_ink(self, leaves: list, t_on: float, t_off: float, used: set[int]) -> None:
+        fresh = [m for m in leaves if id(m) not in used]
+        if not fresh:
             return
-        # Stem
-        d = ev.dir
-        ys = [self.Y(ev.staff, n.pos) for n in ev.notes]
-        sx = ev.x + d * hw * 0.93
-        start_y = min(ys) if d == 1 else max(ys)
-        ext_y = max(ys) if d == 1 else min(ys)
-        tip = ext_y + d * 3.5 * S
-        mid = self.Y(ev.staff, 4)
-        if (d == 1 and tip < mid) or (d == -1 and tip > mid):
-            tip = mid
-        ev_info = (sx, start_y, ext_y, tip)
-        if id(ev) in self.beamed:
-            ev.info = ev_info
-            return
-        stem = Line([sx, start_y, 0], [sx, tip, 0], stroke_width=2.4)
-        self._ink(stem, ev.t_on, ev.t_off)
-        for i in range(FLAGS.get(ev.type, 0)):
-            fy = tip - d * i * 0.95 * S
-            pts = [(0, 0), (0.9, -0.5), (1.25, -1.5), (0.75, -2.7)]
-            cp = [[sx + px * S, fy + d * py * S, 0] for px, py in pts]
-            flag = VMobject(stroke_width=3.4)
-            flag.set_points(np.array(cp, dtype=float))
-            flag.set_fill(opacity=0)
-            self._ink(flag, ev.t_on, ev.t_off)
-
-    def _ledgers(self, ev: Event, n: Note, x: float) -> None:
-        S = self.S
-        lows = range(-2, n.pos - 1, -2) if n.pos <= -2 else []
-        highs = range(10, n.pos + 1, 2) if n.pos >= 10 else []
-        for p in list(lows) + list(highs):
-            y = self.Y(ev.staff, p)
-            ln = Line([x - 1.7 * self.hw, y, 0], [x + 1.7 * self.hw, y, 0], stroke_width=2.6)
-            self._ink(ln, ev.t_on, ev.t_off)
-
-    def _accidentals(self, ev: Event, accs: list[Note], offsets: dict[int, float]) -> None:
-        S = self.S
-        cols: list[int] = []  # last pos per column
-        for n in sorted(accs, key=lambda n: -n.pos):
-            col = next((i for i, lp in enumerate(cols) if lp - n.pos >= 6), None)
-            if col is None:
-                cols.append(n.pos)
-                col = len(cols) - 1
-            else:
-                cols[col] = n.pos
-            ch = ACC_GLYPHS[n.acc]
-            h = 2.7 * S if ch in ("♯", "♮", "×") else 2.2 * S
-            g = self._glyph(ch, h)
-            left = min(offsets[id(m)] for m in ev.notes)
-            x = ev.x + left - self.hw - (0.9 + 1.0 * col) * S
-            y = self.Y(ev.staff, n.pos) + (0.3 * S if ch.startswith("♭") else 0.0)
-            g.move_to([x, y, 0])
-            self._ink(g, ev.t_on, ev.t_off)
-
-    def _beam_poly(self, xa: float, ya: float, xb: float, yb: float, th: float) -> Polygon:
-        poly = Polygon([xa, ya, 0], [xb, yb, 0], [xb, yb - th, 0], [xa, ya - th, 0])
-        poly.set_fill(opacity=1).set_stroke(width=0)
-        return poly
-
-    def _render_beams(self) -> None:
-        S = self.S
-        for grp in self.beam_groups:
-            d = grp[0].dir
-            infos = [e.info for e in grp]
-            xs = [i[0] for i in infos]
-            tips = [i[3] for i in infos]
-            slope_y = tips[-1] - tips[0]
-            lim = 1.5 * S
-            ya = tips[0]
-            yb = tips[0] + max(-lim, min(lim, slope_y))
-            k = (yb - ya) / (xs[-1] - xs[0]) if xs[-1] != xs[0] else 0.0
-            line = lambda x: ya + k * (x - xs[0])  # noqa: E731
-            need = max(d * ((i[2] + d * 2.9 * S) - line(x)) for i, x in zip(infos, xs))
-            if need > 0:
-                ya += d * need
-            line = lambda x: ya + k * (x - xs[0])  # noqa: E731
-            th = 0.5 * S
-            t_on, t_off = grp[0].t_on, max(e.t_off for e in grp)
-            pitch = 0.78 * S
-            for ev, (sx, sy, ey, tp) in zip(grp, infos):
-                end = line(sx) - d * th / 2
-                stem = Line([sx, sy, 0], [sx, end, 0], stroke_width=2.4)
-                self._ink(stem, ev.t_on, ev.t_off)
-            maxlevel = max(max(e.beams) for e in grp)
-            hw = 0.012
-            for L in range(1, maxlevel + 1):
-                off = -d * (L - 1) * pitch
-                seg_start = None
-                for i, ev in enumerate(grp):
-                    st = ev.beams.get(L)
-                    sx = xs[i]
-                    if st == "begin":
-                        seg_start = i
-                    elif st == "end" and seg_start is not None:
-                        self._add_beam(xs[seg_start] - hw, sx + hw, line, off, th, t_on, t_off)
-                        seg_start = None
-                    elif st == "forward hook":
-                        self._add_beam(sx - hw, sx + 0.3, line, off, th, ev.t_on, ev.t_off)
-                    elif st == "backward hook":
-                        self._add_beam(sx - 0.3, sx + hw, line, off, th, ev.t_on, ev.t_off)
-
-    def _add_beam(self, a: float, b: float, line, off: float, th: float, t_on: float, t_off: float) -> None:
-        poly = self._beam_poly(a, line(a) + off, b, line(b) + off, th)
-        self._ink(poly, t_on, t_off)
-
-    def _rests(self) -> None:
-        S = self.S
-        idxs = {m.index: m for m in self.plan.measures}
-        for r in self.score.rests:
-            if r.measure not in idxs:
-                continue
-            m = idxs[r.measure]
-            if r.whole_measure or r.type == "":
-                xa = self.X(m.start)
-                xb = self.X(m.start + m.length) - self._barline_offset(m)
-                x = (xa + xb) / 2
-                self._rest_shape(r.staff, "whole", x, r.pos)
-            else:
-                self._rest_shape(r.staff, r.type, self.X(r.start), r.pos)
-
-    def _rest_shape(self, staff: int, kind: str, x: float, pos: int | None) -> None:
-        S = self.S
-        if kind == "whole":
-            y = self.Y(staff, pos if pos is not None else 6)
-            r = self._rect(x, y - 0.25 * S, 1.5 * S, 0.5 * S)
-        elif kind == "half":
-            y = self.Y(staff, pos if pos is not None else 4)
-            r = self._rect(x, y + 0.25 * S, 1.5 * S, 0.5 * S)
-        elif kind == "quarter":
-            y = self.Y(staff, pos if pos is not None else 4)
-            pts = [(-0.3, 1.6), (0.4, 0.7), (-0.3, -0.1), (0.35, -0.9), (-0.05, -1.7)]
-            r = VMobject(stroke_width=4.2)
-            r.set_points_smoothly([[x + px * S, y + py * S, 0] for px, py in pts])
-            r.set_fill(opacity=0)
-        else:
-            n = FLAGS.get(kind, 1)
-            y = self.Y(staff, pos if pos is not None else 4)
-            r = VGroup(Line([x + 0.35 * S, y + 1.0 * S, 0], [x - 0.3 * S, y - 1.0 * S - (n - 1) * 0.8 * S, 0],
-                            stroke_width=3.0))
-            for i in range(n):
-                dot = Circle(radius=0.3 * S).set_fill(opacity=1).set_stroke(width=0)
-                dot.move_to([x - 0.2 * S + 0.0 - i * 0.28 * S + 0.3 * S, y + 0.75 * S - i * 0.8 * S, 0])
-                r.add(dot)
-        self._static(r, REST)
-
-    def _rect(self, cx: float, cy: float, w: float, h: float) -> Polygon:
-        p = Polygon([cx - w / 2, cy - h / 2, 0], [cx + w / 2, cy - h / 2, 0],
-                    [cx + w / 2, cy + h / 2, 0], [cx - w / 2, cy + h / 2, 0])
-        p.set_fill(opacity=1).set_stroke(width=0)
-        return p
-
-    def _barlines(self) -> None:
-        top, bot = self.Y(1, 8), self.Y(self.staff_ids[-1], 0)
-        ms = self.plan.measures
-        for i, m in enumerate(ms):
-            x = self.X(m.start + m.length) - self._barline_offset(m)
-            if i == len(ms) - 1:
-                x = self.x_end
-                if m is self.score.measures[-1]:
-                    for dx, w in ((-0.09, 2.2), (0.0, 7.0)):
-                        for s in self.staff_ids:
-                            self._static(Line([x + dx, self.Y(s, 8), 0], [x + dx, self.Y(s, 0), 0], stroke_width=w), MARK)
-                    continue
-            for s in self.staff_ids:
-                self._static(Line([x, self.Y(s, 8), 0], [x, self.Y(s, 0), 0], stroke_width=2.2), MARK)
-
-    def _dynamics(self) -> None:
-        b0, b1 = self.plan.b0, self.plan.b1
-        for beat, name in self.score.dynamics:
-            if b0 <= beat < b1:
-                t = Text(name, font=FONT_TEXT, slant="ITALIC", weight="BOLD")
-                t.scale_to_fit_height(1.6 * self.S if len(name) > 1 else 1.9 * self.S)
-                mid = (self.Y(1, 0) + self.Y(self.staff_ids[-1], 8)) / 2 if self.score.staves == 2 else self.Y(1, -3)
-                t.move_to([self.X(beat), mid, 0])
-                self._static(t, "#9A948A")
-
-    def _links(self) -> None:
-        S = self.S
-        idxs = {m.index for m in self.plan.measures}
-        for ln in self.score.links:
-            ina, inb = ln.a.measure in idxs, ln.b.measure in idxs
-            if not (ina or inb):
-                continue
-            ya = self.Y(ln.a.staff, ln.a.pos)
-            yb = self.Y(ln.b.staff, ln.b.pos)
-            up = (ln.placement == "above") if ln.placement else (ln.a.stem == "down" if ln.kind == "tie" else True)
-            if ln.kind == "tie" and ln.placement is None:
-                up = ln.a.stem == "down" or (ln.a.stem is None and ln.a.pos >= 4)
-                chord = [n.pos for n in self.score.notes
-                         if n.staff == ln.a.staff and n.voice == ln.a.voice and abs(n.start - ln.a.start) < 1e-6]
-                if len(chord) > 1 and ln.a.pos in (max(chord), min(chord)):
-                    up = ln.a.pos == max(chord)
-            sgn = 1 if up else -1
-            xa = self.X(ln.a.start) + (self.hw + 0.15 * S if ina else 0)
-            xb = self.X(ln.b.start) - (self.hw + 0.15 * S) if inb else self.x_end - 0.1
-            if ln.kind == "slur":
-                xa = self.X(ln.a.start) if ina else self.x0 - 0.1
-                xb = self.X(ln.b.start) if inb else self.x_end - 0.1
-            if not ina:
-                xa = self.x0 + 0.05
-                ya = yb
-            if not inb:
-                yb = ya
-            gap = 0.9 * S if ln.kind == "tie" else 1.4 * S
-            ya += sgn * gap
-            yb += sgn * gap
-            w = xb - xa
-            if w <= 0.05:
-                continue
-            h = min(0.9 * S + 0.04 * w, 1.4 * S) if ln.kind == "tie" else min(1.2 * S + 0.16 * w, 3.2 * S)
-            th = 0.22 * S
-            c1 = [xa + w * 0.28, ya + sgn * h * 1.3, 0]
-            c2 = [xb - w * 0.28, yb + sgn * h * 1.3, 0]
-            p0, p3 = [xa, ya, 0], [xb, yb, 0]
-            c1i = [c1[0], c1[1] - sgn * th * 2.0, 0]
-            c2i = [c2[0], c2[1] - sgn * th * 2.0, 0]
-            arc = VMobject()
-            arc.set_points(np.array([p0, c1, c2, p3, p3, c2i, c1i, p0], dtype=float))
-            arc.set_fill(opacity=1).set_stroke(width=0)
-            self._static(arc, TIE)
+        used.update(id(m) for m in fresh)
+        g = VGroup(*fresh)
+        g.set_color(UNPLAYED)
+        self.inks.append(Ink(g, t_on, t_off))
 
     # -- per-frame
-    def x_at_beat(self, beat: float) -> float:
-        return self.X(beat)
+    def X(self, beat: float) -> float:
+        return float(np.interp(beat, [k[0] for k in self.knots], [k[1] for k in self.knots]))
 
     def y_extent(self) -> tuple[float, float]:
-        S = self.S
-        return self.Y(self.staff_ids[0], 8) + 2.2 * S, self.Y(self.staff_ids[-1], 0) - 2.2 * S
+        return self.y_top, self.y_bot
 
     def refresh(self, t: float, vis: float) -> None:
         """Update colours; `vis` mixes everything toward the background."""
-        full = abs(vis - self.vis) > 1e-3
-        if full:
+        if abs(vis - self.vis) > 1e-3:
             self.vis = vis
             for mob, color in self.statics:
                 mob.set_color(_col(_BG + (_rgb(color) - _BG) * vis))
@@ -906,66 +407,36 @@ class System:
         self.active_glows = keepg
 
 
-# ------------------------------------------------------------------ plan ---
-def plan_systems(score: Score, cfg: Config) -> list[SystemPlan]:
-    S = cfg.space
-
-    def header_width(first: bool, fifths: int) -> float:
-        return 0.35 + 0.18 + 0.7 + abs(fifths) * 1.05 * S + (0.6 if first else 0.0) + 0.1
-
-    def solve_u(ms: list[Measure], first: bool) -> float:
-        hw = header_width(first, ms[0].fifths)
-        beats = sum(m.length for m in ms)
-        target = cfg.slot_width - hw - 0.4
-        d = max(ms[-1].length - ms[-1].last_onset, 0.25)
-        u = target / (beats - d / 2)
-        if d * u / 2 > 0.8:
-            u = (target + 0.8) / beats
-        return u
-
-    plans: list[SystemPlan] = []
-    i = 0
-    ms = score.measures
-    while i < len(ms):
-        first = i == 0
-        j = i + 1
-        while j < len(ms) and solve_u(ms[i:j + 1], first) >= cfg.u_min and ms[j].fifths == ms[i].fifths:
-            j += 1
-        chunk = ms[i:j]
-        u = min(solve_u(chunk, first), cfg.u_max)
-        plans.append(SystemPlan(
-            chunk, chunk[0].start, chunk[-1].start + chunk[-1].length,
-            header_width(first, chunk[0].fifths), u, first, chunk[0].fifths, chunk[0].time, chunk[0].clefs,
-        ))
-        i = j
-    return plans
+@dataclass
+class Ink:
+    mob: Mobject
+    t_on: float
+    t_off: float
 
 
 # ----------------------------------------------------------------- scene ---
 class SheetScene(Scene):
-    def __init__(self, score: Score, tempo: TempoMap, cfg: Config, still: float | None = None, **kw):
+    def __init__(self, meta: Meta, eng: Engraving, tempo: TempoMap, cfg: Config, still: float | None = None, **kw):
         super().__init__(**kw)
-        self.score, self.tempo, self.cfg, self.still = score, tempo, cfg, still
+        self.meta, self.eng, self.tempo, self.cfg, self.still = meta, eng, tempo, cfg, still
 
     def construct(self) -> None:
-        score, tempo, cfg = self.score, self.tempo, self.cfg
-        S = cfg.space
-        plans = plan_systems(score, cfg)
+        meta, eng, tempo, cfg = self.meta, self.eng, self.tempo, self.cfg
+        plans = eng.plans
         left = -cfg.slot_width / 2
+        lead = cfg.lead
         self.systems = [
-            System(p, score, tempo, cfg, left, cfg.slot_y if i % 2 == 0 else -cfg.slot_y, cfg.lead)
+            System(p, eng, tempo, cfg, left, cfg.slot_y if i % 2 == 0 else -cfg.slot_y, lead)
             for i, p in enumerate(plans)
         ]
-        # Fix each system's staff-line extent to the drawn width.
-        lead = cfg.lead
         T = [lead + tempo.seconds(p.b0) for p in plans] + [lead + tempo.seconds(plans[-1].b1)]
         end = T[-1]
         total = end + cfg.tail
         fade_start = end + 1.2
         self.T, self.end = T, end
 
-        title = Text(score.title, font=FONT_TEXT, color=TITLE).scale_to_fit_height(0.5).move_to([0, 0.3, 0])
-        sub = Text(score.composer, font=FONT_TEXT, color=SUBTITLE) if score.composer else None
+        title = Text(meta.title, font="Palatino", color=TITLE).scale_to_fit_height(0.5).move_to([0, 0.3, 0])
+        sub = Text(meta.composer, font="Palatino", color=SUBTITLE) if meta.composer else None
         if sub:
             sub.scale_to_fit_height(0.26).next_to(title, direction=[0, -1, 0], buff=0.35)
         title_group = VGroup(*(m for m in (title, sub) if m))
@@ -990,9 +461,7 @@ class SheetScene(Scene):
             a = 0.4 * smooth((t - fade_in_at[i]) / 1.6)
             b = smooth((t - (T[i] - 1.4)) / 1.2)
             v = max(a, b)
-            if i + 2 < len(plans) or True:
-                v = min(v, 1 - smooth((t - T[i + 1]) / 1.2)) if i + 1 < len(T) else v
-            return v
+            return min(v, 1 - smooth((t - T[i + 1]) / 1.2))
 
         state = {"t": 0.0}
 
@@ -1035,8 +504,6 @@ class SheetScene(Scene):
 
         title_group.set_opacity(0)
         self.add(title_group)
-        for sysm in self.systems:
-            sysm._render_beams()
         driver = Mobject()
         driver.add_updater(update)
         self.add(driver)
@@ -1055,11 +522,12 @@ def render(
     still: float | None = None,
     title: str | None = None,
 ) -> Path:
-    score = parse_musicxml(src)
+    meta = read_meta(src)
     if title:
-        score.title = title
-    tempo = TempoMap(score.tempos, default_bpm, speed, bpm)
+        meta.title = title
     cfg = Config()
+    eng = engrave(src, cfg)
+    tempo = TempoMap(eng.tempos if meta.has_tempo else [], default_bpm, speed, bpm)
     w, h, f = (1280, 720, 15) if preview else (3840, 2160, 30)
     settings = {
         "pixel_width": w,
@@ -1073,10 +541,10 @@ def render(
         "write_to_movie": still is None,
         "disable_caching": True,
         "progress_bar": "display",
-        "verbosity": "WARNING",
+        "verbosity": "ERROR",
     }
     with tempconfig(settings):
-        scene = SheetScene(score, tempo, cfg, still=still)
+        scene = SheetScene(meta, eng, tempo, cfg, still=still)
         scene.render()
     media = out.parent / ".manim_media"
     ext = ".png" if still is not None else ".mp4"
