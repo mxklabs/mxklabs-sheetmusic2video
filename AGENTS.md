@@ -19,7 +19,8 @@ Default operating instructions for Copilot coding agents in this repository.
 3. Defaults define the standard look. Keep them unless a visual fix requires changing one.
 4. Fade notation by opacity (`System._paint`), never by mixing toward the background colour; the lit background would make notes read as dark silhouettes.
 5. Z-order is by `z_index` (cursor 10, keyboard 3-7, lights and dust negative), not by add order.
-6. Keep the look sophisticated and slow: muted palette, gentle motion, readable score first.
+6. Glows are dithered gradient images (`soft_light`), never stacked translucent discs, which show rings. Create per-note glow images lazily from a pool; copying an `ImageMobject` is slow.
+7. Keep the look sophisticated and slow: muted palette, gentle motion, readable score first.
 
 ## Testing Rules
 
@@ -29,14 +30,14 @@ Default operating instructions for Copilot coding agents in this repository.
 
 ## Example Input and Commands
 
-- Example: `~/Library/CloudStorage/Dropbox/Music/Scores/InProgress/MK16.2 - SFA/mk16.1 - 10.musicxml` (no tempo marking, so the default is 60 bpm).
+- Example: `~/Library/CloudStorage/Dropbox/Music/Scores/InProgress/MK16.2 - SFA/mk16.1 - 10.musicxml` (no tempo marking, so the default is 120 bpm).
 - Still: `.venv/bin/python sheet2video.py <file> --still 60 --preview -o /tmp/x.png`
 - Video: `.venv/bin/python sheet2video.py <file> -o output/name.mp4`
 
 ## Known Limitations
 
 - Low bass notes with many ledger lines can approach the keyboard.
-- Tied-to notes are absent from Verovio's timemap, so their onset is inferred from horizontal position, and they do not re-press keys.
+- Tie chains (from Verovio's MEI `<tie>` elements) are one continuous note: all heads light together and the key is pressed once, from the first onset to the last release.
 - The video has no audio.
 
 ## Agent Response Expectations

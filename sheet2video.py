@@ -26,6 +26,8 @@ import numpy as np
 import verovio
 from manim import (
     Circle,
+    Group,
+    ImageMobject,
     Line,
     ManimColor,
     Mobject,
@@ -34,6 +36,7 @@ from manim import (
     Scene,
     SVGMobject,
     Text,
+    UP,
     VGroup,
     tempconfig,
 )
@@ -63,7 +66,7 @@ class Config:
     unplayed: str = _f("#D8D2C5", "notes not yet played")
     active: str = _f("#E6C58C", "notes while sounding")
     played: str = _f("#8892A2", "notes after they have sounded")
-    staff: str = _f("#4B525D", "staff lines")
+    staff: str = _f("#1e508a", "staff lines")
     mark: str = _f("#8C919A", "clefs, key/time signatures, barlines")
     rest: str = _f("#7A808A", "rests, ledger lines, pedal marks")
     tie: str = _f("#757C87", "ties and slurs")
@@ -213,6 +216,7 @@ class Engraving:
     pitch: dict[str, int]  # note id -> MIDI pitch (timemap notes only)
     tempos: list[tuple[float, float]]
     end: float
+    tied: set[str]  # notes tied to an earlier note; they share its sounding span
 
 
 def engrave(src: Path, cfg: Config) -> Engraving:
@@ -249,6 +253,15 @@ def engrave(src: Path, cfg: Config) -> Engraving:
         if "tempo" in e:
             tempos.append((q, float(e["tempo"])))
     end = max(float(e["qstamp"]) for e in tm)
+    # A tie chain is one continuous note: every member shares the first onset and the last release.
+    nxt = dict(re.findall(r'<tie [^>]*startid="#([\w-]+)" endid="#([\w-]+)"', tk.getMEI({})))
+    tied = {b for b in nxt.values() if b in on}
+    for root in (a for a in nxt if a not in tied and a in on):
+        chain = [root]
+        while chain[-1] in nxt and nxt[chain[-1]] in on:
+            chain.append(nxt[chain[-1]])
+        for m in chain:
+            on[m], off[m] = on[root], off[chain[-1]]
     pitch = {i: int(tk.getMIDIValuesForElement(i)["pitch"]) for i in on}
 
     svgs = [tk.renderToSVG(p) for p in range(1, tk.getPageCount() + 1)]
@@ -261,7 +274,7 @@ def engrave(src: Path, cfg: Config) -> Engraving:
                    re.findall(r'<g id="([\w-]+)" class="note"', svg))
         for i, svg in enumerate(svgs)
     ]
-    return Engraving(plans, on, off, sorted(set(on.values())), pitch, tempos, end)
+    return Engraving(plans, on, off, sorted(set(on.values())), pitch, tempos, end, tied)
 
 
 class System:
@@ -274,11 +287,12 @@ class System:
         self.un, self.ac, self.pl = _rgb(cfg.unplayed), _rgb(cfg.active), _rgb(cfg.played)
         self.statics: list[tuple[Mobject, str, bool]] = []
         self.inks: list[Ink] = []
-        self.glows: list[tuple[VGroup, float, float]] = []
+        self.glows: list[tuple[Mobject, float, float]] = []  # (head leaf, on, off); images are made lazily
+        self.glow_pool: list[ImageMobject] = []
         self.vis = -1.0
         self.active: list[Ink] = []
-        self.active_glows: list[tuple[VGroup, float, float]] = []
-        self.glow_layer = VGroup()
+        self.active_glows: list[tuple[Mobject, float, float]] = []
+        self.glow_layer = Group()
 
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "system.svg"
@@ -300,7 +314,7 @@ class System:
         self.x_end += ox + 0.3 - left
         self.y_top = max(m.get_top()[1] for m in lines) + 2.2 * self.S
         self.y_bot = min(m.get_bottom()[1] for m in lines) - 2.2 * self.S
-        self.group = VGroup(self.glow_layer, svg)
+        self.group = Group(self.glow_layer, svg)
 
         self._classify(leaves, lines, eng)
         self.pending = sorted(self.inks, key=lambda i: i.t_on)
@@ -346,11 +360,9 @@ class System:
             t_off = max(self.sec(q1), t_on + self.cfg.min_note)
             self._add_ink(ls, t_on, t_off, used)
             head = self._head(ls)
-            knots.setdefault(q0, []).append(float(head.get_center()[0]))
-            glow = VGroup(*[Circle(radius=r * self.S).move_to(head.get_center()) for r in (1.1, 1.8, 2.6)])
-            for c in glow:
-                c.set_fill(self.cfg.active, opacity=0).set_stroke(width=0)
-            self.glows.append((glow, t_on, t_off))
+            if i not in eng.tied:  # a tied-to head sits later than the shared onset
+                knots.setdefault(q0, []).append(float(head.get_center()[0]))
+            self.glows.append((head, t_on, t_off))
 
         # Chord stems and beams belong to several notes; colour them over the group's span.
         for cls in ("chord", "beam"):
@@ -456,18 +468,20 @@ class System:
                 keep.append(ink)
         self.active = keep
         while self.pending_glows and self.pending_glows[0][1] <= t:
-            g = self.pending_glows.pop(0)
-            self.active_glows.append(g)
-            self.glow_layer.add(g[0])
+            head, a, b = self.pending_glows.pop(0)
+            img = self.glow_pool.pop() if self.glow_pool else soft_light(cfg.active, 2.6 * self.S, 0.13)
+            img.move_to(head.get_center())
+            self.active_glows.append((img, a, b))
+            self.glow_layer.add(img)
         keepg = []
         for g in self.active_glows:
             env = glow_env(t, g[1], g[2], cfg.glow_ramp, cfg.glow_decay) * vis * cfg.glow
-            for c, a in zip(g[0], (0.07, 0.04, 0.022)):
-                c.set_fill(cfg.active, opacity=a * env)
+            set_light(g[0], env)
             if t <= g[2] + cfg.glow_decay:
                 keepg.append(g)
             else:
                 self.glow_layer.remove(g[0])
+                self.glow_pool.append(g[0])
         self.active_glows = keepg
 
 
@@ -478,19 +492,35 @@ class Ink:
     t_off: float
 
 
-def soft_light(color: str, radius: float, peak: float, rings: int = 9) -> VGroup:
-    """Radial glow built from stacked translucent discs (peak = opacity at the centre)."""
-    g = VGroup(*[Circle(radius=radius * (i + 1) / rings) for i in range(rings)])
-    for c in g:
-        c.set_fill(color, opacity=peak / rings).set_stroke(width=0)
-    g.base = peak / rings  # type: ignore[attr-defined]
-    g.color_hex = color  # type: ignore[attr-defined]
+_LIGHT_CACHE: dict[tuple, ImageMobject] = {}
+
+
+def soft_light(color: str, radius: float, peak: float) -> ImageMobject:
+    """Radial glow as a smooth gradient image; peak = opacity at the centre.
+
+    The alpha is dithered so the 8-bit gradient (and its video compression) shows no rings.
+    """
+    px = int(min(1024, max(128, radius * 160)))
+    key = (color, px, round(peak, 4))
+    if key not in _LIGHT_CACHE:
+        yy, xx = np.mgrid[-1:1:px * 1j, -1:1:px * 1j]
+        a = np.clip(1 - (xx ** 2 + yy ** 2), 0, 1) ** 3
+        noise = np.random.default_rng(1).uniform(-3, 3, a.shape) * np.clip(a * 20, 0, 1)
+        arr = np.zeros((px, px, 4), dtype=np.uint8)
+        arr[..., :3] = (_rgb(color) * 255).round().astype(np.uint8)
+        arr[..., 3] = np.clip(np.round(a * peak * 255 + noise), 0, 255).astype(np.uint8)
+        _LIGHT_CACHE[key] = ImageMobject(arr)
+    g = _LIGHT_CACHE[key].copy()
+    g.scale_to_fit_height(2 * radius)
+    g.k = 1.0  # type: ignore[attr-defined]
     return g
 
 
-def set_light(g: VGroup, k: float) -> None:
-    for c in g:
-        c.set_fill(g.color_hex, opacity=g.base * k)  # type: ignore[attr-defined]
+def set_light(g: ImageMobject, k: float) -> None:
+    k = min(max(k, 0.0), 1.0)
+    if abs(k - g.k) > 1e-3:  # type: ignore[attr-defined]
+        g.set_opacity(k)
+        g.k = k  # type: ignore[attr-defined]
 
 
 # ----------------------------------------------------------------- scene ---
@@ -506,6 +536,7 @@ class Keyboard:
         self.keys: dict[int, RoundedRectangle] = {}
         self.is_black: dict[int, bool] = {}
         self.dy: dict[int, float] = {}
+        self.black_h = cfg.keyboard_height * 0.62
         n_white = sum(1 for m in range(self.FIRST, self.LAST + 1) if m % 12 in self.WHITE_PCS)
         w = cfg.keyboard_width / n_white
         h, top = cfg.keyboard_height, cfg.keyboard_top
@@ -535,8 +566,8 @@ class Keyboard:
         board = Rectangle(width=cfg.keyboard_width + 0.3, height=0.08, stroke_width=0)
         board.set_fill(cfg.key_edge, opacity=1).move_to([0, top + 0.04, 0]).set_z_index(3)
         self.board = board
-        self.group = VGroup(board, *whites, *blacks, *labels)
-        self.glows: dict[int, VGroup] = {}
+        self.group = Group(board, *whites, *blacks, *labels)
+        self.glows: dict[int, ImageMobject] = {}
         self.lit: set[int] = set()
         self.k = -1.0
         black_active = _rgb(cfg.active) * 0.65 + _rgb(cfg.key_black) * 0.35
@@ -551,13 +582,11 @@ class Keyboard:
         key.set_fill(_col(rgb), opacity=k)
         key.set_stroke(self.cfg.key_edge, width=1.2, opacity=k)
 
-    def _glow(self, m: int) -> VGroup:
+    def _glow(self, m: int) -> ImageMobject:
         if m not in self.glows:
             key = self.keys[m]
-            x, y = key.get_center()[0], self.cfg.keyboard_top
-            g = VGroup(*[Circle(radius=r).move_to([x, y, 0]) for r in (0.18, 0.3, 0.45)])
-            for c in g:
-                c.set_fill(self.cfg.active, opacity=0).set_stroke(width=0)
+            g = soft_light(self.cfg.active, 0.45, 0.15).move_to([key.get_center()[0], self.cfg.keyboard_top, 0])
+            set_light(g, 0.0)
             g.set_z_index(7)
             self.glows[m] = g
         return self.glows[m]
@@ -586,12 +615,15 @@ class Keyboard:
         self.active = keep
         for m in set(env) | self.lit:
             e = env.get(m, 0.0)
-            target = -0.02 * e
-            self.keys[m].shift([0, target - self.dy[m], 0])
-            self.dy[m] = target
+            dip = 0.02 * e
+            if self.is_black[m]:  # keep the top edge fixed; the key lengthens downward
+                h0 = self.keys[m].height
+                self.keys[m].stretch((self.black_h + dip) / h0, 1, about_edge=UP)
+            else:
+                self.keys[m].shift([0, -(dip - self.dy[m]), 0])
+            self.dy[m] = dip
             g = self._glow(m)
-            for c, a in zip(g, (0.08, 0.045, 0.022)):
-                c.set_fill(cfg.active, opacity=a * e * k * cfg.glow)
+            set_light(g, e * k * cfg.glow)
             if e > 0 and g not in self.group.submobjects:
                 self.group.add(g)
             elif e == 0 and g in self.group.submobjects:
@@ -634,12 +666,12 @@ class SheetScene(Scene):
 
         # Atmosphere: two slow ambient lights, a light that follows the cursor, and drifting dust.
         ambient = [
-            (soft_light(cfg.light_cool, 8.0, 0.55, 22), (4.2, 2.0), (31.0, 43.0), 0.0),
-            (soft_light(cfg.light_warm, 6.5, 0.38, 22), (4.8, 1.6), (37.0, 29.0), 2.1),
+            (soft_light(cfg.light_cool, 8.0, 0.55), (4.2, 2.0), (31.0, 43.0), 0.0),
+            (soft_light(cfg.light_warm, 6.5, 0.38), (4.8, 1.6), (37.0, 29.0), 2.1),
         ]
         for light, *_ in ambient:
             light.set_z_index(-10)
-        cursor_light = soft_light(cfg.cursor, 3.0, cfg.cursor_light, 14)
+        cursor_light = soft_light(cfg.cursor, 3.0, cfg.cursor_light)
         cursor_light.set_z_index(-5)
         rng = np.random.default_rng(cfg.seed)
         dust = []
@@ -658,7 +690,7 @@ class SheetScene(Scene):
         if cfg.keyboard:
             events = []
             for nid, q0 in eng.on.items():
-                if nid in eng.pitch:
+                if nid in eng.pitch and nid not in eng.tied:
                     t0 = lead + tempo.seconds(q0)
                     t1 = max(lead + tempo.seconds(eng.off.get(nid, q0)), t0 + cfg.min_note)
                     events.append((eng.pitch[nid], t0, t1))
