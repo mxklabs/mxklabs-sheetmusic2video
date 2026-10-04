@@ -26,6 +26,7 @@ Default operating instructions for Copilot coding agents in this repository.
 
 - Never render a whole video to test. Use `--still SECONDS` (add `--preview` for 720p) and view the PNG.
 - Check several times (for example 25 s, 60 s, 140 s) since layout and lighting vary.
+- Stills skip manim's static-frame cache, so they can hide bugs that only show in video. The updater mobject (`driver`) must stay first by `z_index` (-100); anything ordered before it is frozen into a static image. After touching scene structure, render a few seconds of video of one system (not the whole piece) and compare frames.
 - A full 4K render takes about 12+ minutes; only run it when the user asks.
 
 ## Example Input and Commands

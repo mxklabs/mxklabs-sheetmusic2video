@@ -638,6 +638,10 @@ class SheetScene(Scene):
 
     def construct(self) -> None:
         meta, eng, tempo, cfg = self.meta, self.eng, self.tempo, self.cfg
+        # Manim caches everything ordered (by z_index) before the first updater mobject as a static image.
+        driver = Mobject()
+        driver.set_z_index(-100)
+        self.add(driver)
         plans = eng.plans
         left = -cfg.slot_width / 2
         lead = cfg.lead
@@ -774,9 +778,7 @@ class SheetScene(Scene):
 
         title_group.set_opacity(0)
         self.add(title_group)
-        driver = Mobject()
         driver.add_updater(update)
-        self.add(driver)
         self.wait(self.still if self.still is not None else total)
 
 
