@@ -19,7 +19,7 @@ import sys
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
@@ -37,28 +37,64 @@ from manim import (
 )
 
 # ---------------------------------------------------------------- palette ---
-BG = "#0B0E12"
-UNPLAYED = "#D8D2C5"
-ACTIVE = "#E6C58C"
-PLAYED = "#8892A2"
-STAFF = "#4B525D"
-MARK = "#8C919A"
-REST = "#7A808A"
-TIE = "#757C87"
-CURSOR = "#C9AE7B"
-TITLE = "#D8D2C5"
-SUBTITLE = "#7F8591"
 
 VEROVIO_STAFF_SPACE_PX = 18.0  # one staff space in Verovio's SVG pixels (sets how many measures fit per system)
 
 
+def _f(default, help: str):
+    return field(default=default, metadata={"help": help})
+
+
 @dataclass
 class Config:
-    space: float = 0.18  # staff space in scene units
-    slot_width: float = 12.6
-    slot_y: float = 2.0
-    lead: float = 7.0  # seconds before the first beat
-    tail: float = 3.0
+    """Every field becomes a --kebab-case command-line option; defaults are the standard look."""
+
+    # layout
+    space: float = _f(0.18, "staff space in scene units (smaller = more measures per system)")
+    slot_width: float = _f(12.6, "width of a system in scene units")
+    slot_y: float = _f(2.0, "vertical distance of the two system slots from the centre")
+    lead: float = _f(7.0, "seconds before the first beat (title card + fade-in)")
+    tail: float = _f(3.0, "seconds after the last beat")
+    # colours
+    bg: str = _f("#0B0E12", "background")
+    unplayed: str = _f("#D8D2C5", "notes not yet played")
+    active: str = _f("#E6C58C", "notes while sounding")
+    played: str = _f("#8892A2", "notes after they have sounded")
+    staff: str = _f("#4B525D", "staff lines")
+    mark: str = _f("#8C919A", "clefs, key/time signatures, barlines")
+    rest: str = _f("#7A808A", "rests, ledger lines, pedal marks")
+    tie: str = _f("#757C87", "ties and slurs")
+    cursor: str = _f("#C9AE7B", "playback cursor and its light")
+    title_color: str = _f("#D8D2C5", "title card text")
+    subtitle_color: str = _f("#7F8591", "composer text")
+    light_cool: str = _f("#3C4F73", "cool ambient light")
+    light_warm: str = _f("#6B5233", "warm ambient light")
+    dust_color: str = _f("#CFC6B4", "floating dust")
+    # note animation
+    note_ramp: float = _f(0.22, "seconds for a note to warm up when it sounds")
+    note_decay: float = _f(1.8, "seconds for a note to fade to the played colour")
+    min_note: float = _f(0.5, "minimum seconds a note stays lit")
+    glow: float = _f(1.0, "note halo strength multiplier (0 = off)")
+    glow_ramp: float = _f(0.2, "seconds for a halo to appear")
+    glow_decay: float = _f(1.6, "seconds for a halo to fade")
+    # system transitions
+    dim: float = _f(0.4, "brightness of the waiting system (notes stay hidden until it nears)")
+    fade_in: float = _f(1.6, "seconds for a new waiting system to fade in")
+    fade_out: float = _f(1.2, "seconds for a finished system to fade out")
+    approach: float = _f(1.4, "seconds before playing that the next system brightens")
+    # floating and lighting
+    float_x: float = _f(0.035, "horizontal drift amplitude (0 = none)")
+    float_y: float = _f(0.055, "vertical drift amplitude (0 = none)")
+    float_period_x: float = _f(13.0, "seconds per horizontal drift cycle")
+    float_period_y: float = _f(9.0, "seconds per vertical drift cycle")
+    ambient: float = _f(1.0, "ambient light strength multiplier (0 = off)")
+    cursor_light: float = _f(0.16, "opacity of the light following the cursor (0 = off)")
+    cursor_opacity: float = _f(0.7, "opacity of the cursor line")
+    cursor_width: float = _f(2.4, "stroke width of the cursor line")
+    dust_count: int = _f(26, "number of dust specks (0 = none)")
+    dust_opacity: float = _f(1.0, "dust opacity multiplier")
+    dust_size: float = _f(1.0, "dust size multiplier")
+    seed: int = _f(7, "random seed for dust placement")
 
 
 @dataclass
@@ -119,9 +155,6 @@ def _rgb(c: str) -> np.ndarray:
     return np.array(ManimColor(c).to_rgb())
 
 
-_BG, _UN, _AC, _PL = _rgb(BG), _rgb(UNPLAYED), _rgb(ACTIVE), _rgb(PLAYED)
-
-
 def _col(rgb: np.ndarray) -> ManimColor:
     return ManimColor.from_rgb(tuple(float(v) for v in np.clip(rgb, 0, 1)))
 
@@ -131,24 +164,24 @@ def smooth(x: float) -> float:
     return x * x * (3 - 2 * x)
 
 
-def ink_rgb(t: float, t_on: float, t_off: float) -> np.ndarray:
+def ink_rgb(t: float, t_on: float, t_off: float, un: np.ndarray, ac: np.ndarray, pl: np.ndarray,
+            ramp: float, decay: float) -> np.ndarray:
     if t < t_on:
-        return _UN
-    ramp = 0.22
+        return un
     a_on = smooth((t - t_on) / ramp)
     if t < t_off:
-        return _UN + (_AC - _UN) * a_on
+        return un + (ac - un) * a_on
     a_off = smooth((t_off - t_on) / ramp)
-    start = _UN + (_AC - _UN) * a_off
-    return start + (_PL - start) * smooth((t - t_off) / 1.8)
+    start = un + (ac - un) * a_off
+    return start + (pl - start) * smooth((t - t_off) / decay)
 
 
-def glow_env(t: float, t_on: float, t_off: float) -> float:
+def glow_env(t: float, t_on: float, t_off: float, ramp: float, decay: float) -> float:
     if t < t_on:
         return 0.0
     if t < t_off:
-        return smooth((t - t_on) / 0.2)
-    return smooth((t_off - t_on) / 0.2) * (1 - smooth((t - t_off) / 1.6))
+        return smooth((t - t_on) / ramp)
+    return smooth((t_off - t_on) / ramp) * (1 - smooth((t - t_off) / decay))
 
 
 # --------------------------------------------------------------- engraving ---
@@ -225,7 +258,8 @@ class System:
                  ox: float, oy: float, lead: float):
         self.plan, self.cfg, self.lead, self.tempo = plan, cfg, lead, tempo
         self.S = cfg.space
-        self.statics: list[tuple[Mobject, str]] = []
+        self.un, self.ac, self.pl = _rgb(cfg.unplayed), _rgb(cfg.active), _rgb(cfg.played)
+        self.statics: list[tuple[Mobject, str, bool]] = []
         self.inks: list[Ink] = []
         self.glows: list[tuple[VGroup, float, float]] = []
         self.vis = -1.0
@@ -238,6 +272,7 @@ class System:
             path.write_text(plan.svg, encoding="utf-8")
             svg = SVGMobject(str(path), height=None, should_center=False)
         leaves = list(svg.submobjects)
+        self.base = {id(m): (float(m.get_fill_opacity()), float(m.get_stroke_opacity())) for m in leaves}
         flat = [m for m in leaves if m.height < 1e-3 and m.width > 0]
         widest = max(m.width for m in flat)
         lines = [m for m in flat if m.width > 0.15 * widest]  # staff lines, not ledger lines
@@ -295,13 +330,13 @@ class System:
                 continue
             q0, q1 = times[i]
             t_on = self.sec(q0)
-            t_off = max(self.sec(q1), t_on + 0.5)
+            t_off = max(self.sec(q1), t_on + self.cfg.min_note)
             self._add_ink(ls, t_on, t_off, used)
             head = self._head(ls)
             knots.setdefault(q0, []).append(float(head.get_center()[0]))
             glow = VGroup(*[Circle(radius=r * self.S).move_to(head.get_center()) for r in (1.1, 1.8, 2.6)])
             for c in glow:
-                c.set_fill(ACTIVE, opacity=0).set_stroke(width=0)
+                c.set_fill(self.cfg.active, opacity=0).set_stroke(width=0)
             self.glows.append((glow, t_on, t_off))
 
         # Chord stems and beams belong to several notes; colour them over the group's span.
@@ -313,25 +348,31 @@ class System:
                 members = [times[n] for n in ids("note") if n in times and self._inside(leaves_of(n), leaves_of(i))]
                 if own and members:
                     t_on = self.sec(min(m[0] for m in members))
-                    t_off = max(self.sec(max(m[1] for m in members)), t_on + 0.5)
+                    t_off = max(self.sec(max(m[1] for m in members)), t_on + self.cfg.min_note)
                     self._add_ink(own, t_on, t_off, used)
 
-        for cls in ("rest", "mRest"):
+        for cls in ("rest", "mRest", "pedal"):
             for i in ids(cls):
                 for m in leaves_of(i):
                     if id(m) not in used:
                         used.add(id(m))
-                        self._static(m, REST)
+                        self._static(m, self.cfg.rest, True)
         for cls in ("tie", "slur"):
             for i in ids(cls):
                 for m in leaves_of(i):
                     if id(m) not in used:
                         used.add(id(m))
-                        self._static(m, TIE)
+                        self._static(m, self.cfg.tie, True)
         line_ids = {id(m) for m in lines}
+        flat_ids = {id(m) for m in leaves if m.height < 1e-3 and m.width > 0}
         for m in leaves:
             if id(m) not in used:
-                self._static(m, STAFF if id(m) in line_ids else MARK)
+                if id(m) in line_ids:
+                    self._static(m, self.cfg.staff)
+                elif id(m) in flat_ids:  # ledger lines are note-level notation
+                    self._static(m, self.cfg.rest, True)
+                else:
+                    self._static(m, self.cfg.mark)
 
         if not knots:
             self.knots: list[tuple[float, float]] = [(self.plan.b0, self.x_end), (self.plan.b1, self.x_end)]
@@ -352,9 +393,9 @@ class System:
     def _head(leaves: list):
         return max(leaves, key=lambda m: m.width)
 
-    def _static(self, mob: Mobject, color: str) -> None:
+    def _static(self, mob: Mobject, color: str, notation: bool = False) -> None:
         mob.set_color(color)
-        self.statics.append((mob, color))
+        self.statics.append((mob, color, notation))
 
     def _add_ink(self, leaves: list, t_on: float, t_off: float, used: set[int]) -> None:
         fresh = [m for m in leaves if id(m) not in used]
@@ -362,7 +403,7 @@ class System:
             return
         used.update(id(m) for m in fresh)
         g = VGroup(*fresh)
-        g.set_color(UNPLAYED)
+        g.set_color(self.cfg.unplayed)
         self.inks.append(Ink(g, t_on, t_off))
 
     # -- per-frame
@@ -372,24 +413,33 @@ class System:
     def y_extent(self) -> tuple[float, float]:
         return self.y_top, self.y_bot
 
+    def _paint(self, leaves: list, color, k: float) -> None:
+        # Fade by opacity, not by mixing toward BG, so notes never read darker than the lit background.
+        for m in leaves:
+            f, s = self.base[id(m)]
+            m.set_fill(color, opacity=f * k)
+            m.set_stroke(color, opacity=s * k)
+
     def refresh(self, t: float, vis: float) -> None:
-        """Update colours; `vis` mixes everything toward the background."""
+        """Update colours; `vis` fades the system, and notation stays hidden while it only waits."""
+        cfg = self.cfg
+        nv = max(0.0, (vis - (cfg.dim + 0.02)) / (1 - cfg.dim - 0.02))
         if abs(vis - self.vis) > 1e-3:
             self.vis = vis
-            for mob, color in self.statics:
-                mob.set_color(_col(_BG + (_rgb(color) - _BG) * vis))
+            for mob, color, notation in self.statics:
+                self._paint([mob], color, nv if notation else vis)
             for ink in self.inks:
                 if ink.t_on > t:
-                    ink.mob.set_color(_col(_BG + (_UN - _BG) * vis))
-                elif t > ink.t_off + 1.8:
-                    ink.mob.set_color(_col(_BG + (_PL - _BG) * vis))
+                    self._paint(ink.mob.submobjects, cfg.unplayed, nv)
+                elif t > ink.t_off + cfg.note_decay:
+                    self._paint(ink.mob.submobjects, cfg.played, nv)
         while self.pending and self.pending[0].t_on <= t:
             self.active.append(self.pending.pop(0))
         keep: list[Ink] = []
         for ink in self.active:
-            c = ink_rgb(t, ink.t_on, ink.t_off)
-            ink.mob.set_color(_col(_BG + (c - _BG) * vis))
-            if t <= ink.t_off + 1.8:
+            rgb = ink_rgb(t, ink.t_on, ink.t_off, self.un, self.ac, self.pl, cfg.note_ramp, cfg.note_decay)
+            self._paint(ink.mob.submobjects, _col(rgb), nv)
+            if t <= ink.t_off + cfg.note_decay:
                 keep.append(ink)
         self.active = keep
         while self.pending_glows and self.pending_glows[0][1] <= t:
@@ -398,10 +448,10 @@ class System:
             self.glow_layer.add(g[0])
         keepg = []
         for g in self.active_glows:
-            env = glow_env(t, g[1], g[2]) * vis
+            env = glow_env(t, g[1], g[2], cfg.glow_ramp, cfg.glow_decay) * vis * cfg.glow
             for c, a in zip(g[0], (0.07, 0.04, 0.022)):
-                c.set_fill(ACTIVE, opacity=a * env)
-            if t <= g[2] + 1.6:
+                c.set_fill(cfg.active, opacity=a * env)
+            if t <= g[2] + cfg.glow_decay:
                 keepg.append(g)
             else:
                 self.glow_layer.remove(g[0])
@@ -451,14 +501,14 @@ class SheetScene(Scene):
         fade_start = end + 1.2
         self.T, self.end = T, end
 
-        title = Text(meta.title, font="Palatino", color=TITLE).scale_to_fit_height(0.5).move_to([0, 0.3, 0])
-        sub = Text(meta.composer, font="Palatino", color=SUBTITLE) if meta.composer else None
+        title = Text(meta.title, font="Palatino", color=cfg.title_color).scale_to_fit_height(0.5).move_to([0, 0.3, 0])
+        sub = Text(meta.composer, font="Palatino", color=cfg.subtitle_color) if meta.composer else None
         if sub:
             sub.scale_to_fit_height(0.26).next_to(title, direction=[0, -1, 0], buff=0.35)
         title_group = VGroup(*(m for m in (title, sub) if m))
 
         cursor = VGroup(
-            Line([0, 0, 0], [0, 1, 0], stroke_width=2.4),
+            Line([0, 0, 0], [0, 1, 0], stroke_width=cfg.cursor_width),
             Line([0, 0, 0], [0, 1, 0], stroke_width=14),
         )
         cursor.set_z_index(10)  # systems are added later, so order alone would draw them over it
@@ -466,21 +516,21 @@ class SheetScene(Scene):
 
         # Atmosphere: two slow ambient lights, a light that follows the cursor, and drifting dust.
         ambient = [
-            (soft_light("#3C4F73", 8.0, 0.55, 22), (4.2, 2.0), (31.0, 43.0), 0.0),
-            (soft_light("#6B5233", 6.5, 0.38, 22), (4.8, 1.6), (37.0, 29.0), 2.1),
+            (soft_light(cfg.light_cool, 8.0, 0.55, 22), (4.2, 2.0), (31.0, 43.0), 0.0),
+            (soft_light(cfg.light_warm, 6.5, 0.38, 22), (4.8, 1.6), (37.0, 29.0), 2.1),
         ]
         for light, *_ in ambient:
             light.set_z_index(-10)
-        cursor_light = soft_light(CURSOR, 3.0, 0.16, 14)
+        cursor_light = soft_light(cfg.cursor, 3.0, cfg.cursor_light, 14)
         cursor_light.set_z_index(-5)
-        rng = np.random.default_rng(7)
+        rng = np.random.default_rng(cfg.seed)
         dust = []
-        for _ in range(26):
-            r = float(rng.uniform(0.01, 0.028))
-            d = Circle(radius=r).set_stroke(width=0).set_fill("#CFC6B4", opacity=0)
+        for _ in range(cfg.dust_count):
+            r = float(rng.uniform(0.02, 0.05)) * cfg.dust_size
+            d = Circle(radius=r).set_stroke(width=0).set_fill(cfg.dust_color, opacity=0)
             d.set_z_index(-8)
             dust.append((d, rng.uniform(-7.1, 7.1), rng.uniform(0, 8), rng.uniform(0.04, 0.11),
-                         rng.uniform(0.2, 0.7), rng.uniform(0.15, 0.45), rng.uniform(0, 6.28), rng.uniform(5, 11)))
+                         rng.uniform(0.2, 0.7), rng.uniform(0.25, 0.7), rng.uniform(0, 6.28), rng.uniform(5, 11)))
         for light, *_ in ambient:
             self.add(light)
         for d, *_ in dust:
@@ -497,10 +547,10 @@ class SheetScene(Scene):
                 fade_in_at.append(T[i - 1] + 1.4)
 
         def vis_of(i: int, t: float) -> float:
-            a = 0.4 * smooth((t - fade_in_at[i]) / 1.6)
-            b = smooth((t - (T[i] - 1.4)) / 1.2)
+            a = cfg.dim * smooth((t - fade_in_at[i]) / cfg.fade_in)
+            b = smooth((t - (T[i] - cfg.approach)) / 1.2)
             v = max(a, b)
-            return min(v, 1 - smooth((t - T[i + 1]) / 1.2))
+            return min(v, 1 - smooth((t - T[i + 1]) / cfg.fade_out))
 
         state = {"t": 0.0}
 
@@ -513,13 +563,13 @@ class SheetScene(Scene):
             fade_in = smooth(t / 4.0)
             for light, (ax, ay), (px, py), ph in ambient:
                 light.move_to([ax * math.sin(2 * math.pi * t / px + ph), ay * math.cos(2 * math.pi * t / py + ph), 0])
-                set_light(light, fade_in * g)
+                set_light(light, fade_in * g * cfg.ambient)
             for d, x0, y0, speed, sway, peak, ph, per in dust:
                 y = (y0 + speed * t) % 8.4 - 4.2
                 d.move_to([x0 + sway * math.sin(2 * math.pi * t / per + ph), y, 0])
                 edge = smooth(min(y + 4.2, 4.2 - y) / 1.2)
                 twinkle = 0.65 + 0.35 * math.sin(2 * math.pi * t / (per * 0.6) + ph)
-                d.set_fill("#CFC6B4", opacity=peak * edge * twinkle * fade_in * g)
+                d.set_fill(cfg.dust_color, opacity=peak * edge * twinkle * fade_in * g * cfg.dust_opacity)
             cur = None
             for i, sysm in enumerate(self.systems):
                 v = vis_of(i, t) * g
@@ -531,8 +581,8 @@ class SheetScene(Scene):
                     in_scene.discard(i)
                 if i in in_scene:
                     # Slow, out-of-phase drift so the staves seem to float.
-                    target = np.array([0.035 * math.sin(2 * math.pi * t / 13 + i * 1.7),
-                                       0.055 * math.sin(2 * math.pi * t / 9 + i * 2.3), 0.0])
+                    target = np.array([cfg.float_x * math.sin(2 * math.pi * t / cfg.float_period_x + i * 1.7),
+                                       cfg.float_y * math.sin(2 * math.pi * t / cfg.float_period_y + i * 2.3), 0.0])
                     sysm.group.shift(target - offsets.get(i, np.zeros(3)))
                     offsets[i] = target
                     sysm.refresh(t, v)
@@ -551,8 +601,8 @@ class SheetScene(Scene):
             a = smooth((t - (lead - 1.4)) / 1.0) * g
             cursor_light.move_to([x, (y_top + y_bot) / 2, 0])
             set_light(cursor_light, a)
-            cursor[0].set_stroke(CURSOR, opacity=0.7 * a)
-            cursor[1].set_stroke(CURSOR, opacity=0.07 * a)
+            cursor[0].set_stroke(cfg.cursor, opacity=cfg.cursor_opacity * a)
+            cursor[1].set_stroke(cfg.cursor, opacity=0.07 * a)
             if a > 0.002 and not cursor_state["in"]:
                 self.add(cursor, cursor_light)
                 cursor_state["in"] = True
@@ -579,11 +629,12 @@ def render(
     default_bpm: float = 60.0,
     still: float | None = None,
     title: str | None = None,
+    cfg: Config | None = None,
 ) -> Path:
     meta = read_meta(src)
     if title:
         meta.title = title
-    cfg = Config()
+    cfg = cfg or Config()
     eng = engrave(src, cfg)
     tempo = TempoMap(eng.tempos if meta.has_tempo else [], default_bpm, speed, bpm)
     w, h, f = (1280, 720, 15) if preview else (3840, 2160, 30)
@@ -591,7 +642,7 @@ def render(
         "pixel_width": w,
         "pixel_height": h,
         "frame_rate": fps or f,
-        "background_color": BG,
+        "background_color": cfg.bg,
         "media_dir": str(out.parent / ".manim_media"),
         "output_file": out.stem,
         "format": "png" if still is not None else "mp4",
@@ -614,6 +665,10 @@ def render(
     return out
 
 
+COLOR_FIELDS = ("bg", "unplayed", "active", "played", "staff", "mark", "rest", "tie", "cursor", "title_color",
+                "subtitle_color", "light_cool", "light_warm", "dust_color")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("musicxml", type=Path)
@@ -625,9 +680,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--speed", type=float, default=1.0, help="tempo multiplier (0.8 = slower)")
     ap.add_argument("--still", type=float, help="save one PNG frame at this time (seconds)")
     ap.add_argument("--title", help="override the title card text")
+    style = ap.add_argument_group("style and tuning (defaults shown)")
+    defaults = Config()
+    for f in fields(Config):
+        d = getattr(defaults, f.name)
+        style.add_argument("--" + f.name.replace("_", "-"), dest=f.name, type=type(d), default=None,
+                           metavar="HEX" if f.name in COLOR_FIELDS else type(d).__name__.upper(),
+                           help=f"{f.metadata['help']} [{d}]")
     a = ap.parse_args(argv)
+    cfg = Config(**{f.name: getattr(a, f.name) for f in fields(Config) if getattr(a, f.name) is not None})
+    for name in COLOR_FIELDS:
+        ManimColor(getattr(cfg, name))  # fail early on a bad colour
     out = a.output or a.musicxml.with_suffix(".png" if a.still is not None else ".mp4")
-    print(render(a.musicxml, out, a.preview, a.fps, a.bpm, a.speed, a.default_bpm, a.still, a.title))
+    print(render(a.musicxml, out, a.preview, a.fps, a.bpm, a.speed, a.default_bpm, a.still, a.title, cfg))
     return 0
 
 
