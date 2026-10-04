@@ -29,6 +29,8 @@ from manim import (
     Line,
     ManimColor,
     Mobject,
+    Rectangle,
+    RoundedRectangle,
     Scene,
     SVGMobject,
     Text,
@@ -50,9 +52,10 @@ class Config:
     """Every field becomes a --kebab-case command-line option; defaults are the standard look."""
 
     # layout
-    space: float = _f(0.18, "staff space in scene units (smaller = more measures per system)")
+    space: float = _f(0.14, "staff space in scene units (smaller = more measures per system)")
     slot_width: float = _f(12.6, "width of a system in scene units")
-    slot_y: float = _f(2.0, "vertical distance of the two system slots from the centre")
+    slot_top: float = _f(2.35, "vertical centre of the top system")
+    slot_bottom: float = _f(-0.35, "vertical centre of the bottom system")
     lead: float = _f(7.0, "seconds before the first beat (title card + fade-in)")
     tail: float = _f(3.0, "seconds after the last beat")
     # colours
@@ -70,6 +73,14 @@ class Config:
     light_cool: str = _f("#3C4F73", "cool ambient light")
     light_warm: str = _f("#6B5233", "warm ambient light")
     dust_color: str = _f("#CFC6B4", "floating dust")
+    key_white: str = _f("#B9B3A6", "white piano keys")
+    key_black: str = _f("#12161C", "black piano keys")
+    key_edge: str = _f("#1A1F27", "piano key outlines")
+    # keyboard
+    keyboard: int = _f(1, "show the 88-key keyboard (0 = hide)")
+    keyboard_width: float = _f(13.0, "keyboard width in scene units")
+    keyboard_height: float = _f(1.05, "white key height in scene units")
+    keyboard_top: float = _f(-2.6, "y of the top edge of the keys")
     # note animation
     note_ramp: float = _f(0.22, "seconds for a note to warm up when it sounds")
     note_decay: float = _f(1.8, "seconds for a note to fade to the played colour")
@@ -199,6 +210,7 @@ class Engraving:
     on: dict[str, float]  # note id -> onset (quarter notes)
     off: dict[str, float]
     onsets: list[float]  # every onset in the piece, sorted
+    pitch: dict[str, int]  # note id -> MIDI pitch (timemap notes only)
     tempos: list[tuple[float, float]]
     end: float
 
@@ -237,6 +249,7 @@ def engrave(src: Path, cfg: Config) -> Engraving:
         if "tempo" in e:
             tempos.append((q, float(e["tempo"])))
     end = max(float(e["qstamp"]) for e in tm)
+    pitch = {i: int(tk.getMIDIValuesForElement(i)["pitch"]) for i in on}
 
     svgs = [tk.renderToSVG(p) for p in range(1, tk.getPageCount() + 1)]
     starts = []
@@ -248,7 +261,7 @@ def engrave(src: Path, cfg: Config) -> Engraving:
                    re.findall(r'<g id="([\w-]+)" class="note"', svg))
         for i, svg in enumerate(svgs)
     ]
-    return Engraving(plans, on, off, sorted(set(on.values())), tempos, end)
+    return Engraving(plans, on, off, sorted(set(on.values())), pitch, tempos, end)
 
 
 class System:
@@ -481,6 +494,111 @@ def set_light(g: VGroup, k: float) -> None:
 
 
 # ----------------------------------------------------------------- scene ---
+class Keyboard:
+    """88-key piano (A0-C8) at the bottom of the frame; keys light as notes sound."""
+
+    FIRST, LAST = 21, 108
+    WHITE_PCS = {0, 2, 4, 5, 7, 9, 11}
+    BLACK_SHIFT = {1: -0.1, 3: 0.1, 6: -0.12, 8: 0.0, 10: 0.12}  # in white-key widths
+
+    def __init__(self, cfg: Config, events: list[tuple[int, float, float]]):
+        self.cfg = cfg
+        self.keys: dict[int, RoundedRectangle] = {}
+        self.is_black: dict[int, bool] = {}
+        self.dy: dict[int, float] = {}
+        n_white = sum(1 for m in range(self.FIRST, self.LAST + 1) if m % 12 in self.WHITE_PCS)
+        w = cfg.keyboard_width / n_white
+        h, top = cfg.keyboard_height, cfg.keyboard_top
+        left = -cfg.keyboard_width / 2
+        whites, blacks, labels = [], [], []
+        wi = -1
+        for m in range(self.FIRST, self.LAST + 1):
+            pc = m % 12
+            if pc in self.WHITE_PCS:
+                wi += 1
+                k = RoundedRectangle(width=w - 0.012, height=h, corner_radius=0.03)
+                k.move_to([left + (wi + 0.5) * w, top - h / 2, 0]).set_z_index(4)
+                whites.append(k)
+                if pc == 0:
+                    lab = Text(f"C{m // 12 - 1}", font="Palatino").scale_to_fit_height(0.075)
+                    lab.move_to([left + (wi + 0.5) * w, top - h + 0.11, 0]).set_z_index(5)
+                    labels.append(lab)
+            else:
+                bh = h * 0.62
+                k = RoundedRectangle(width=w * 0.58, height=bh, corner_radius=0.02)
+                k.move_to([left + (wi + 1 + self.BLACK_SHIFT[pc]) * w, top - bh / 2, 0]).set_z_index(6)
+                blacks.append(k)
+            self.keys[m] = k
+            self.is_black[m] = pc not in self.WHITE_PCS
+            self.dy[m] = 0.0
+        self.labels = labels
+        board = Rectangle(width=cfg.keyboard_width + 0.3, height=0.08, stroke_width=0)
+        board.set_fill(cfg.key_edge, opacity=1).move_to([0, top + 0.04, 0]).set_z_index(3)
+        self.board = board
+        self.group = VGroup(board, *whites, *blacks, *labels)
+        self.glows: dict[int, VGroup] = {}
+        self.lit: set[int] = set()
+        self.k = -1.0
+        black_active = _rgb(cfg.active) * 0.65 + _rgb(cfg.key_black) * 0.35
+        self.base = {False: _rgb(cfg.key_white), True: _rgb(cfg.key_black)}
+        self.hot = {False: _rgb(cfg.active), True: black_active}
+        self.events = sorted(events, key=lambda e: e[1])
+        self.pending = list(self.events)
+        self.active: list[tuple[int, float, float]] = []
+
+    def _paint(self, m: int, rgb: np.ndarray, k: float) -> None:
+        key = self.keys[m]
+        key.set_fill(_col(rgb), opacity=k)
+        key.set_stroke(self.cfg.key_edge, width=1.2, opacity=k)
+
+    def _glow(self, m: int) -> VGroup:
+        if m not in self.glows:
+            key = self.keys[m]
+            x, y = key.get_center()[0], self.cfg.keyboard_top
+            g = VGroup(*[Circle(radius=r).move_to([x, y, 0]) for r in (0.18, 0.3, 0.45)])
+            for c in g:
+                c.set_fill(self.cfg.active, opacity=0).set_stroke(width=0)
+            g.set_z_index(7)
+            self.glows[m] = g
+        return self.glows[m]
+
+    def refresh(self, t: float, k: float) -> None:
+        cfg = self.cfg
+        if abs(k - self.k) > 1e-3:
+            self.k = k
+            for m in self.keys:
+                self._paint(m, self.base[self.is_black[m]], k)
+            self.board.set_fill(cfg.key_edge, opacity=k)
+            for lab in self.labels:
+                lab.set_fill(cfg.key_black, opacity=0.55 * k)
+        while self.pending and self.pending[0][1] <= t:
+            self.active.append(self.pending.pop(0))
+        env: dict[int, float] = {}
+        keep = []
+        for ev in self.active:
+            m, t_on, t_off = ev
+            b = self.is_black[m]
+            rgb = ink_rgb(t, t_on, t_off, self.base[b], self.hot[b], self.base[b], cfg.note_ramp, cfg.note_decay)
+            self._paint(m, rgb, k)
+            env[m] = max(env.get(m, 0.0), glow_env(t, t_on, t_off, cfg.note_ramp, cfg.note_decay))
+            if t <= t_off + cfg.note_decay:
+                keep.append(ev)
+        self.active = keep
+        for m in set(env) | self.lit:
+            e = env.get(m, 0.0)
+            target = -0.02 * e
+            self.keys[m].shift([0, target - self.dy[m], 0])
+            self.dy[m] = target
+            g = self._glow(m)
+            for c, a in zip(g, (0.08, 0.045, 0.022)):
+                c.set_fill(cfg.active, opacity=a * e * k * cfg.glow)
+            if e > 0 and g not in self.group.submobjects:
+                self.group.add(g)
+            elif e == 0 and g in self.group.submobjects:
+                self.group.remove(g)
+        self.lit = set(env)
+
+
 class SheetScene(Scene):
     def __init__(self, meta: Meta, eng: Engraving, tempo: TempoMap, cfg: Config, still: float | None = None, **kw):
         super().__init__(**kw)
@@ -492,7 +610,7 @@ class SheetScene(Scene):
         left = -cfg.slot_width / 2
         lead = cfg.lead
         self.systems = [
-            System(p, eng, tempo, cfg, left, cfg.slot_y if i % 2 == 0 else -cfg.slot_y, lead)
+            System(p, eng, tempo, cfg, left, cfg.slot_top if i % 2 == 0 else cfg.slot_bottom, lead)
             for i, p in enumerate(plans)
         ]
         T = [lead + tempo.seconds(p.b0) for p in plans] + [lead + tempo.seconds(plans[-1].b1)]
@@ -536,6 +654,16 @@ class SheetScene(Scene):
         for d, *_ in dust:
             self.add(d)
         offsets = {}
+        keyboard = None
+        if cfg.keyboard:
+            events = []
+            for nid, q0 in eng.on.items():
+                if nid in eng.pitch:
+                    t0 = lead + tempo.seconds(q0)
+                    t1 = max(lead + tempo.seconds(eng.off.get(nid, q0)), t0 + cfg.min_note)
+                    events.append((eng.pitch[nid], t0, t1))
+            keyboard = Keyboard(cfg, [e for e in events if Keyboard.FIRST <= e[0] <= Keyboard.LAST])
+            self.add(keyboard.group)
         in_scene: set[int] = set()
         fade_in_at = []
         for i in range(len(plans)):
@@ -561,6 +689,8 @@ class SheetScene(Scene):
             ta = smooth((t - 0.6) / 1.4) * (1 - smooth((t - (lead - 3.4)) / 1.4))
             title_group.set_opacity(ta)
             fade_in = smooth(t / 4.0)
+            if keyboard:
+                keyboard.refresh(t, smooth((t - (lead - 3.2)) / 1.6) * g)
             for light, (ax, ay), (px, py), ph in ambient:
                 light.move_to([ax * math.sin(2 * math.pi * t / px + ph), ay * math.cos(2 * math.pi * t / py + ph), 0])
                 set_light(light, fade_in * g * cfg.ambient)
@@ -666,7 +796,7 @@ def render(
 
 
 COLOR_FIELDS = ("bg", "unplayed", "active", "played", "staff", "mark", "rest", "tie", "cursor", "title_color",
-                "subtitle_color", "light_cool", "light_warm", "dust_color")
+                "subtitle_color", "light_cool", "light_warm", "dust_color", "key_white", "key_black", "key_edge")
 
 
 def main(argv: list[str] | None = None) -> int:
