@@ -8,13 +8,18 @@ quiet grey-blue.
     python sheet2video.py score.musicxml -o score.mp4            # 4K
     python sheet2video.py score.musicxml --preview               # 720p, fast
     python sheet2video.py score.musicxml --still 20 -o frame.png # one frame
+    python sheet2video.py score.musicxml --start 40 --duration 8 --workers 2 -o excerpt.mp4
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import math
+import multiprocessing
+import os
 import re
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -24,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import verovio
+from tqdm import tqdm
 from manim import (
     Circle,
     Group,
@@ -632,9 +638,13 @@ class Keyboard:
 
 
 class SheetScene(Scene):
-    def __init__(self, meta: Meta, eng: Engraving, tempo: TempoMap, cfg: Config, still: float | None = None, **kw):
+    def __init__(self, meta: Meta, eng: Engraving, tempo: TempoMap, cfg: Config, still: float | None = None,
+                 start: float = 0.0, duration: float | None = None,
+                 progress_path: Path | None = None, progress_frames: int = 0, **kw):
         super().__init__(**kw)
         self.meta, self.eng, self.tempo, self.cfg, self.still = meta, eng, tempo, cfg, still
+        self.start, self.duration = start, duration
+        self.progress_path, self.progress_frames = progress_path, progress_frames
 
     def construct(self) -> None:
         meta, eng, tempo, cfg = self.meta, self.eng, self.tempo, self.cfg
@@ -716,11 +726,19 @@ class SheetScene(Scene):
             v = max(a, b)
             return min(v, 1 - smooth((t - T[i + 1]) / cfg.fade_out))
 
-        state = {"t": 0.0}
+        state = {"t": self.start}
+        last_progress_frame = 0
+        progress_interval = max(1, int(self.camera.frame_rate))
 
         def update(_m: Mobject, dt: float) -> None:
+            nonlocal last_progress_frame
             state["t"] += dt
             t = state["t"]
+            if self.progress_path is not None:
+                frame = min(self.progress_frames, max(0, int((t - self.start) * self.camera.frame_rate)))
+                if frame - last_progress_frame >= progress_interval:
+                    self.progress_path.write_text(str(frame), encoding="utf-8")
+                    last_progress_frame = frame
             g = 1 - smooth((t - fade_start) / 2.2)
             ta = smooth((t - 0.6) / 1.4) * (1 - smooth((t - (lead - 3.4)) / 1.4))
             title_group.set_opacity(ta)
@@ -779,10 +797,118 @@ class SheetScene(Scene):
         title_group.set_opacity(0)
         self.add(title_group)
         driver.add_updater(update)
-        self.wait(self.still if self.still is not None else total)
+        self.wait(self.still if self.still is not None else (self.duration if self.duration is not None else total - self.start))
 
 
 # ------------------------------------------------------------------- cli ---
+@dataclass(frozen=True)
+class RenderJob:
+    src: Path
+    workdir: Path
+    index: int
+    start: float
+    duration: float
+    width: int
+    height: int
+    fps: int
+    bpm: float | None
+    speed: float
+    default_bpm: float
+    title: str | None
+    cfg: Config
+    progress_path: Path
+    frame_count: int
+
+
+def _render_segment(job: RenderJob) -> Path:
+    meta = read_meta(job.src)
+    if job.title:
+        meta.title = job.title
+    eng = engrave(job.src, job.cfg)
+    tempo = TempoMap(eng.tempos if meta.has_tempo else [], job.default_bpm, job.speed, job.bpm)
+    name = f"part_{job.index:03d}"
+    media = job.workdir / f"media_{job.index:03d}"
+    settings = {
+        "pixel_width": job.width,
+        "pixel_height": job.height,
+        "frame_rate": job.fps,
+        "background_color": job.cfg.bg,
+        "media_dir": str(media),
+        "output_file": name,
+        "format": "mp4",
+        "save_last_frame": False,
+        "write_to_movie": True,
+        "disable_caching": True,
+        "progress_bar": "none",
+        "verbosity": "ERROR",
+    }
+    with tempconfig(settings):
+        SheetScene(meta, eng, tempo, job.cfg, start=job.start, duration=job.duration,
+                   progress_path=job.progress_path, progress_frames=job.frame_count).render()
+    job.progress_path.write_text(str(job.frame_count), encoding="utf-8")
+    found = list(media.rglob(name + ".mp4"))
+    if not found:
+        raise FileNotFoundError(f"Manim produced no segment {name}")
+    destination = job.workdir / f"{name}.mp4"
+    max(found, key=lambda p: p.stat().st_mtime).replace(destination)
+    return destination
+
+
+def _render_parallel(
+    src: Path, out: Path, cfg: Config, start: float, duration: float, width: int, height: int, fps: int,
+    bpm: float | None, speed: float, default_bpm: float, title: str | None, workers: int,
+) -> Path:
+    total_frames = max(1, math.ceil(duration * fps))
+    count = min(workers, total_frames)
+    with tempfile.TemporaryDirectory(prefix="sheet2video-") as tmp:
+        workdir = Path(tmp)
+        jobs = []
+        for i in range(count):
+            first = total_frames * i // count
+            last = total_frames * (i + 1) // count
+            jobs.append(RenderJob(src, workdir, i, start + first / fps, (last - first) / fps,
+                                  width, height, fps, bpm, speed, default_bpm, title, cfg,
+                                  workdir / f"progress_{i:03d}.txt", last - first))
+        completed_frames = [0] * count
+        parts: list[Path | None] = [None] * count
+        with ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("spawn")) as pool, \
+                tqdm(total=total_frames, desc="Rendering", unit="frame", smoothing=0.08) as progress:
+            futures = {pool.submit(_render_segment, job): job for job in jobs}
+            while futures:
+                done, _ = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
+                for job in jobs:
+                    if completed_frames[job.index] == job.frame_count:
+                        continue
+                    try:
+                        rendered = min(job.frame_count, int(job.progress_path.read_text(encoding="utf-8")))
+                    except (FileNotFoundError, ValueError):
+                        continue
+                    delta = max(0, rendered - completed_frames[job.index])
+                    if delta:
+                        progress.update(delta)
+                        completed_frames[job.index] = rendered
+                for future in done:
+                    job = futures.pop(future)
+                    parts[job.index] = future.result()
+                    remaining = job.frame_count - completed_frames[job.index]
+                    if remaining:
+                        progress.update(remaining)
+                        completed_frames[job.index] = job.frame_count
+        part_paths = [p for p in parts if p is not None]
+        if len(part_paths) != count:
+            raise RuntimeError("Parallel render ended before all segments completed")
+        concat_file = workdir / "segments.txt"
+        concat_file.write_text("".join(f"file '{p.as_posix()}'\n" for p in part_paths), encoding="utf-8")
+        merged = workdir / "merged.mp4"
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_file), "-c", "copy", "-movflags", "+faststart", str(merged),
+        ], check=True)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        merged.replace(out)
+    return out
+
+
 def render(
     src: Path,
     out: Path,
@@ -794,6 +920,9 @@ def render(
     still: float | None = None,
     title: str | None = None,
     cfg: Config | None = None,
+    workers: int | None = None,
+    start: float = 0.0,
+    duration: float | None = None,
 ) -> Path:
     meta = read_meta(src)
     if title:
@@ -802,10 +931,28 @@ def render(
     eng = engrave(src, cfg)
     tempo = TempoMap(eng.tempos if meta.has_tempo else [], default_bpm, speed, bpm)
     w, h, f = (1280, 720, 15) if preview else (3840, 2160, 30)
+    fps_value = fps or f
+    total = cfg.lead + tempo.seconds(eng.end) + cfg.tail
+    if start < 0 or start >= total:
+        raise ValueError(f"--start must be between 0 and {total:.2f} seconds")
+    window_duration = duration if duration is not None else total - start
+    if window_duration <= 0:
+        raise ValueError("--duration must be greater than zero")
+    window_duration = min(window_duration, total - start)
+    if workers is None:
+        available_half = max(1, (os.cpu_count() or 1) // 2)
+        worker_count = min(available_half, max(1, math.ceil(window_duration / 15)))
+    else:
+        worker_count = workers
+    if worker_count < 1:
+        raise ValueError("--workers must be at least 1")
+    if still is None and worker_count > 1:
+        return _render_parallel(src, out, cfg, start, window_duration, w, h, fps_value, bpm, speed,
+                                 default_bpm, title, worker_count)
     settings = {
         "pixel_width": w,
         "pixel_height": h,
-        "frame_rate": fps or f,
+        "frame_rate": fps_value,
         "background_color": cfg.bg,
         "media_dir": str(out.parent / ".manim_media"),
         "output_file": out.stem,
@@ -817,7 +964,7 @@ def render(
         "verbosity": "ERROR",
     }
     with tempconfig(settings):
-        scene = SheetScene(meta, eng, tempo, cfg, still=still)
+        scene = SheetScene(meta, eng, tempo, cfg, still=still, start=start, duration=window_duration)
         scene.render()
     media = out.parent / ".manim_media"
     ext = ".png" if still is not None else ".mp4"
@@ -843,6 +990,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--default-bpm", type=float, default=60.0, help="tempo when the score has none")
     ap.add_argument("--speed", type=float, default=1.0, help="tempo multiplier (0.8 = slower)")
     ap.add_argument("--still", type=float, help="save one PNG frame at this time (seconds)")
+    ap.add_argument("--start", type=float, default=0.0, help="absolute timeline start time for a video excerpt")
+    ap.add_argument("--duration", type=float, help="render only this many seconds (useful for short clips)")
+    ap.add_argument("--workers", type=int, default=None,
+                    help=f"parallel video render processes (default: up to half of {os.cpu_count() or 1} available cores; short clips use fewer; 1 disables parallelism)")
     ap.add_argument("--title", help="override the title card text")
     style = ap.add_argument_group("style and tuning (defaults shown)")
     defaults = Config()
@@ -856,7 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
     for name in COLOR_FIELDS:
         ManimColor(getattr(cfg, name))  # fail early on a bad colour
     out = a.output or a.musicxml.with_suffix(".png" if a.still is not None else ".mp4")
-    print(render(a.musicxml, out, a.preview, a.fps, a.bpm, a.speed, a.default_bpm, a.still, a.title, cfg))
+    print(render(a.musicxml, out, a.preview, a.fps, a.bpm, a.speed, a.default_bpm, a.still, a.title,
+                 cfg, a.workers, a.start, a.duration))
     return 0
 
 

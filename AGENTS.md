@@ -21,12 +21,14 @@ Default operating instructions for Copilot coding agents in this repository.
 5. Z-order is by `z_index` (cursor 10, keyboard 3-7, lights and dust negative), not by add order.
 6. Glows are dithered gradient images (`soft_light`), never stacked translucent discs, which show rings. Create per-note glow images lazily from a pool; copying an `ImageMobject` is slow.
 7. Keep the look sophisticated and slow: muted palette, gentle motion, readable score first.
+8. Parallel renders use separate Manim processes, not threads; automatic concurrency is capped at half the available CPU cores and reduced for short clips. Keep time-window rendering deterministic so independently rendered segments join cleanly.
 
 ## Testing Rules
 
 - Never render a whole video to test. Use `--still SECONDS` (add `--preview` for 720p) and view the PNG.
 - Check several times (for example 25 s, 60 s, 140 s) since layout and lighting vary.
 - Stills skip manim's static-frame cache, so they can hide bugs that only show in video. The updater mobject (`driver`) must stay first by `z_index` (-100); anything ordered before it is frozen into a static image. After touching scene structure, render a few seconds of video of one system (not the whole piece) and compare frames.
+- Check parallel output with a short `--start` / `--duration` clip, and verify frame count and seams against `--workers 1` before relying on a full render.
 - A full 4K render takes about 12+ minutes; only run it when the user asks.
 
 ## Example Input and Commands
