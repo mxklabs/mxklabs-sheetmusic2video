@@ -61,7 +61,7 @@ class Config:
     """Every field becomes a --kebab-case command-line option; defaults are the standard look."""
 
     # layout
-    space: float = _f(0.14, "staff space in scene units (smaller = more measures per system)")
+    space: float = _f(0.12, "staff space in scene units (smaller = more measures per system)")
     slot_width: float = _f(12.6, "width of a system in scene units")
     slot_top: float = _f(2.35, "vertical centre of the top system")
     slot_bottom: float = _f(-0.35, "vertical centre of the bottom system")
@@ -103,14 +103,14 @@ class Config:
     fade_out: float = _f(1.2, "seconds for a finished system to fade out")
     approach: float = _f(1.4, "seconds before playing that the next system brightens")
     # floating and lighting
-    float_x: float = _f(0.035, "horizontal drift amplitude (0 = none)")
-    float_y: float = _f(0.055, "vertical drift amplitude (0 = none)")
+    float_x: float = _f(0.0175, "horizontal drift amplitude (0 = none)")
+    float_y: float = _f(0.0275, "vertical drift amplitude (0 = none)")
     float_period_x: float = _f(13.0, "seconds per horizontal drift cycle")
     float_period_y: float = _f(9.0, "seconds per vertical drift cycle")
     ambient: float = _f(1.0, "ambient light strength multiplier (0 = off)")
     cursor_light: float = _f(0.16, "opacity of the light following the cursor (0 = off)")
-    cursor_opacity: float = _f(0.7, "opacity of the cursor line")
-    cursor_width: float = _f(2.4, "stroke width of the cursor line")
+    cursor_opacity: float = _f(0.01, "opacity of the cursor line")
+    cursor_width: float = _f(40.0, "stroke width of the cursor line")
     dust_count: int = _f(26, "number of dust specks (0 = none)")
     dust_opacity: float = _f(1.0, "dust opacity multiplier")
     dust_size: float = _f(1.0, "dust size multiplier")
