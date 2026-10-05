@@ -9,7 +9,7 @@ Default operating instructions for Copilot coding agents in this repository.
 ## Tech Stack
 
 - Python 3.14 in `.venv/` (use `.venv/bin/python`, not the system Python)
-- Manim Community (`manim`), Verovio (engraving, timemap, MIDI pitches), NumPy
+- Manim Community (`manim`), Verovio (engraving, timemap, MIDI pitches), NumPy, Pillow, tqdm
 - ffmpeg on PATH (Homebrew); building pycairo needs `pkgconf`
 
 ## Architecture Rules
@@ -19,28 +19,34 @@ Default operating instructions for Copilot coding agents in this repository.
 3. Defaults define the standard look. Keep them unless a visual fix requires changing one.
 4. Fade notation by opacity (`System._paint`), never by mixing toward the background colour; the lit background would make notes read as dark silhouettes.
 5. Z-order is by `z_index` (cursor 10, keyboard 3-7, lights and dust negative), not by add order.
-6. Glows are dithered gradient images (`soft_light`), never stacked translucent discs, which show rings. Create per-note glow images lazily from a pool; copying an `ImageMobject` is slow.
+6. Glows are smooth, dithered gradients, never stacked translucent discs, which show rings. Reuse/lazily pool note glows; do not create or copy a full-resolution image for every note.
 7. Keep the look sophisticated and slow: muted palette, gentle motion, readable score first.
-8. Parallel renders use separate Manim processes, not threads; automatic concurrency is capped at half the available CPU cores and reduced for short clips. Keep time-window rendering deterministic so independently rendered segments join cleanly.
+8. Prefer composing full-screen ambient light and dust in a low-resolution NumPy/Pillow backdrop; repeated full-resolution image transforms dominate render time. Keep note engraving as Verovio vectors.
+9. Parallel renders use separate Manim processes, not threads; automatic concurrency is capped at half the available CPU cores and reduced for short clips. Keep time-window rendering deterministic so independently rendered segments join cleanly.
+10. Keep a single parent-process progress bar for parallel work; workers report frame progress rather than drawing competing terminal bars.
 
 ## Testing Rules
 
-- Never render a whole video to test. Use `--still SECONDS` (add `--preview` for 720p) and view the PNG.
+- Never render a whole video to test unless the user explicitly asks. Use `--still SECONDS` (add `--preview` for 720p) and view the PNG.
 - Check several times (for example 25 s, 60 s, 140 s) since layout and lighting vary.
 - Stills skip manim's static-frame cache, so they can hide bugs that only show in video. The updater mobject (`driver`) must stay first by `z_index` (-100); anything ordered before it is frozen into a static image. After touching scene structure, render a few seconds of video of one system (not the whole piece) and compare frames.
-- Check parallel output with a short `--start` / `--duration` clip, and verify frame count and seams against `--workers 1` before relying on a full render.
-- A full 4K render takes about 12+ minutes; only run it when the user asks.
+- Check parallel output with a short `--start` / `--duration` clip, and verify frame count, duration, and seams against `--workers 1` before relying on a full render.
+- Profile before optimizing. Compare equal frame-count 4K clips, not unlike workloads; full-resolution raster mobjects and process/encoder oversubscription can erase parallel gains.
+- A full 4K render is expensive; only run it when the user asks.
 
 ## Example Input and Commands
 
-- Example: `~/Library/CloudStorage/Dropbox/Music/Scores/InProgress/MK16.2 - SFA/mk16.1 - 10.musicxml` (no tempo marking, so the default is 120 bpm).
+- Example: `~/Library/CloudStorage/Dropbox/Music/Scores/InProgress/MK16.2 - SFA/mk16.1 - 10.musicxml` (no tempo marking; code default is 60 bpm, and `--bpm 120` can be used when desired).
 - Still: `.venv/bin/python sheet2video.py <file> --still 60 --preview -o /tmp/x.png`
 - Video: `.venv/bin/python sheet2video.py <file> -o output/name.mp4`
+- Parallel excerpt: `.venv/bin/python sheet2video.py <file> --start 50 --duration 4 --workers 2 --preview -o /tmp/check.mp4`
+- `--workers 1` forces serial rendering; otherwise process count is capped at half the available cores and lowered for short clips. Parallel rendering displays one aggregate frame-progress bar.
 
 ## Known Limitations
 
 - Low bass notes with many ledger lines can approach the keyboard.
-- Tie chains (from Verovio's MEI `<tie>` elements) are one continuous note: all heads light together and the key is pressed once, from the first onset to the last release.
+- Tie chains (from Verovio's MEI `<tie>` elements) are one continuous note: all heads light together and the key is pressed once, from the first onset to the last release. Verify ties that cross system boundaries when changing timing/layout code.
+- The active visual style is restrained: dark background, deep blue staff (`#1e508a`), warm muted note/key highlights, slow floating systems, ambient lights and visible drifting dust. Keep this readable rather than adding fast or saturated effects.
 - The video has no audio.
 
 ## Agent Response Expectations
