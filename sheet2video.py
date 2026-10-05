@@ -63,8 +63,8 @@ class Config:
     # layout
     space: float = _f(0.12, "staff space in scene units (smaller = more measures per system)")
     slot_width: float = _f(12.6, "width of a system in scene units")
-    slot_top: float = _f(2.35, "vertical centre of the top system")
-    slot_bottom: float = _f(-0.35, "vertical centre of the bottom system")
+    slot_top: float = _f(2.00, "vertical centre of the top system")
+    slot_bottom: float = _f(-0.95, "vertical centre of the bottom system")
     lead: float = _f(7.0, "seconds before the first beat (title card + fade-in)")
     tail: float = _f(3.0, "seconds after the last beat")
     # colours
